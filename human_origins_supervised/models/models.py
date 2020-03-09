@@ -198,10 +198,8 @@ class Block(AbstractBlock):
 
 
 def set_up_conv_params(current_width: int, kernel_size: int, stride: int):
-    if current_width % 2 != 0 or stride == 1:
-        kernel_size -= 1
 
-    padding = pytorch_utils.calc_conv_padding_needed(
+    padding, kernel_size = pytorch_utils.calc_conv_padding_needed(
         current_width, kernel_size, stride, 1
     )
 
