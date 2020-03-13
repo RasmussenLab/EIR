@@ -10,8 +10,14 @@ from aislib.misc_utils import get_logger, ensure_path_exists
 from sklearn.preprocessing import StandardScaler
 from torch.nn.functional import pad
 from torch.utils.data import Dataset
-from tqdm import tqdm
 
+from human_origins_supervised.data_load.data_loading_funcs import (
+    make_random_snps_missing,
+)
+from human_origins_supervised.data_load.label_setup import (
+    set_up_label_transformers,
+    _streamline_values_for_transformers,
+)
 from human_origins_supervised.data_load.label_setup import (
     set_up_train_and_valid_labels,
     al_label_dict,
@@ -19,14 +25,7 @@ from human_origins_supervised.data_load.label_setup import (
     al_label_transformers,
     get_transformer_path,
 )
-from human_origins_supervised.data_load.data_loading_funcs import (
-    make_random_snps_missing,
-)
 from human_origins_supervised.train_utils.utils import get_run_folder
-from human_origins_supervised.data_load.label_setup import (
-    set_up_label_transformers,
-    _streamline_values_for_transformers,
-)
 
 logger = get_logger(name=__name__, tqdm_compatible=True)
 
@@ -217,7 +216,7 @@ class ArrayDatasetBase(Dataset):
         sample_id_iter = self.labels_dict if self.labels_dict else files
         samples = []
 
-        for sample_id in tqdm(sample_id_iter, desc="Progress"):
+        for sample_id in sample_id_iter:
             raw_sample_labels = self.labels_dict.get(sample_id, None)
             parsed_sample_labels = _transform_labels_in_sample(
                 target_transformers=self.target_transformers,

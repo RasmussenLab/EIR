@@ -7,7 +7,6 @@ import pandas as pd
 from aislib.misc_utils import get_logger
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from tqdm import tqdm
 
 from human_origins_supervised.data_load.common_ops import ColumnOperation
 from human_origins_supervised.train_utils.utils import get_custom_module_submodule
@@ -135,7 +134,7 @@ def _get_extra_columns(
 
 def _gather_ids_from_folder(data_folder: Path):
     logger.debug("Gathering IDs from %s.", data_folder)
-    all_ids = tuple(i.stem for i in tqdm(data_folder.iterdir(), desc="Progress"))
+    all_ids = tuple(i.stem for i in data_folder.iterdir())
 
     return all_ids
 
