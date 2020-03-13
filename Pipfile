@@ -39,6 +39,7 @@ joblib = "*"
 lr-finder = {git = "ssh://git@github.com/arnor-sigurdsson/lr-finder.git",editable = true}
 tensorboard = "*"
 ax-platform = "*"
+ray = {extras = ["tune"],version = "*"}
 
 [requires]
 python_version = "3.7"
