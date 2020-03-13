@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, TYPE_CHECKING
 
+from ray import tune
 import numpy as np
 import pandas as pd
 import torch
@@ -72,6 +73,9 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
         loss=val_loss_avg.item(),
     )
 
+    tune.track.log(
+        best_average_performance=eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
+    )
     write_eval_header = True if iteration == cl_args.sample_interval else False
     metrics.persist_metrics(
         handler_config=handler_config,
