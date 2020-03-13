@@ -56,8 +56,13 @@ def attach_lr_scheduler(
         )
 
 
+def get_eval_history_path(run_name: str):
+    eval_history_fpath = get_run_folder(run_name=run_name) / "v_average_history.log"
+    return eval_history_fpath
+
+
 def _get_reduce_lr_on_plateu_step_params(cl_args: Namespace, config: "Config") -> Dict:
-    eval_history_fpath = get_run_folder(cl_args.run_name) / "v_average_history.log"
+    eval_history_fpath = get_eval_history_path(run_name=cl_args.run_name)
 
     warmup_steps = _get_warmup_steps_from_cla(
         warmup_steps_arg=cl_args.warmup_steps, optimizer=config.optimizer

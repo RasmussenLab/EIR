@@ -638,6 +638,19 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--no_pbar",
+        action="store_true",
+        help="Whether to skip progress bars during training (useful if doing "
+        "distributed / parallel training runs.",
+    )
+
+    parser.add_argument(
+        "--early_stopping",
+        action="store_true",
+        help="Whether to enable early stopping (if no improvement after 2.5 epochs).",
+    )
+
+    parser.add_argument(
         "--custom_lib",
         type=str,
         default=None,

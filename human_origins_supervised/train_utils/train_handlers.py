@@ -10,7 +10,7 @@ import pandas as pd
 from aislib.misc_utils import get_logger
 from ignite.contrib.handlers import ProgressBar
 from ignite.engine import Events, Engine
-from ignite.handlers import ModelCheckpoint
+from ignite.handlers import ModelCheckpoint, EarlyStopping
 from ignite.metrics import RunningAverage
 from torch.utils.tensorboard import SummaryWriter
 
@@ -21,8 +21,10 @@ from human_origins_supervised.train_utils.activation_analysis import (
 )
 from human_origins_supervised.train_utils.evaluation import validation_handler
 from human_origins_supervised.train_utils.lr_scheduling import (
+    get_eval_history_path,
     set_up_scheduler,
     attach_lr_scheduler,
+    _calc_plateu_patience,
 )
 from human_origins_supervised.train_utils.metrics import get_train_metrics
 from human_origins_supervised.train_utils.utils import (
@@ -35,6 +37,7 @@ from human_origins_supervised.train_utils.metrics import (
     get_best_average_performance,
     persist_metrics,
     get_metrics_files,
+    read_metrics_history_file,
 )
 
 if TYPE_CHECKING:
@@ -56,6 +59,29 @@ class HandlerConfig:
     run_name: str
     pbar: ProgressBar
     monitoring_metrics: List[Tuple[str, str]]
+
+
+def _get_early_stopping_handler(trainer: Engine, handler_config: HandlerConfig):
+    cl_args = handler_config.config.cl_args
+    c = handler_config.config
+    eval_history_fpath = get_eval_history_path(run_name=cl_args.run_name)
+
+    def scoring_function(engine):
+        eval_df = read_metrics_history_file(eval_history_fpath)
+        latest_val_loss = eval_df["v_perf-average"].iloc[-1]
+        return latest_val_loss
+
+    plateau_steps = _calc_plateu_patience(
+        steps_per_epoch=len(c.train_loader), sample_interval=cl_args.sample_interval
+    )
+    patience = plateau_steps + int(plateau_steps / 2)
+
+    handler = EarlyStopping(
+        patience=patience, score_function=scoring_function, trainer=trainer
+    )
+    handler.logger = logger
+
+    return handler
 
 
 def configure_trainer(trainer: Engine, config: "Config") -> Engine:
@@ -82,16 +108,28 @@ def configure_trainer(trainer: Engine, config: "Config") -> Engine:
             handler_config=handler_config,
         )
 
-        if _do_run_completed_handler(
-            iter_per_epoch=len(config.train_loader),
-            n_epochs=cl_args.n_epochs,
-            sample_interval=cl_args.sample_interval,
+        if (
+            _do_run_completed_handler(
+                iter_per_epoch=len(config.train_loader),
+                n_epochs=cl_args.n_epochs,
+                sample_interval=cl_args.sample_interval,
+            )
+            and not cl_args.early_stopping
         ):
             trainer.add_event_handler(
                 event_name=Events.COMPLETED,
                 handler=handler,
                 handler_config=handler_config,
             )
+
+    if cl_args.early_stopping:
+        early_stopping_handler = _get_early_stopping_handler(
+            trainer=trainer, handler_config=handler_config
+        )
+        trainer.add_event_handler(
+            Events.ITERATION_COMPLETED(every=cl_args.sample_interval),
+            early_stopping_handler,
+        )
 
     if cl_args.lr_schedule != "same":
         lr_scheduler = set_up_scheduler(handler_config=handler_config)
@@ -100,7 +138,8 @@ def configure_trainer(trainer: Engine, config: "Config") -> Engine:
     _attach_running_average_metrics(
         engine=trainer, monitoring_metrics=monitoring_metrics
     )
-    pbar.attach(engine=trainer, metric_names=["t_loss-average"])
+    if not cl_args.no_pbar:
+        pbar.attach(engine=trainer, metric_names=["t_loss-average"])
 
     trainer.add_event_handler(
         event_name=Events.EPOCH_COMPLETED,
