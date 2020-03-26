@@ -38,8 +38,10 @@ aislib = {ref = "dev",git = "ssh://git@github.com/arnor-sigurdsson/aislib.git",e
 joblib = "*"
 lr-finder = {git = "ssh://git@github.com/arnor-sigurdsson/lr-finder.git",editable = true}
 tensorboard = "*"
-ax-platform = "*"
+ax-platform = "==0.1.6"
 ray = {extras = ["tune"],version = "*"}
+botorch = "==0.1.4"
+sqlalchemy = "*"
 
 [requires]
 python_version = "3.7"

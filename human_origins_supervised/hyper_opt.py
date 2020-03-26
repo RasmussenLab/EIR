@@ -55,6 +55,7 @@ TRAIN_CL_BASE = {
     "find_lr": False,
     "first_kernel_expansion": 1,
     "first_stride_expansion": 1,
+    "first_channel_expansion": 1,
     "get_acts": False,
     "gpu_num": "0",
     "kernel_width": 12,
@@ -165,7 +166,6 @@ def _prep_train_cl_args_namespace(parametrization, output_folder: Path) -> Names
 
 def get_experiment_func(output_folder: Path):
     def run_experiment(parametrization):
-
         train_cl_args = _prep_train_cl_args_namespace(
             parametrization=parametrization, output_folder=output_folder
         )
@@ -283,6 +283,7 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
         scheduler=scheduler,
         search_alg=ax_search_algorithm,
         num_samples=cl_args.total_trials,
+        resources_per_trial={"gpu": 2},
     )
     _analyse_ax_results(ax_client=ax_client)
 
@@ -290,7 +291,6 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--total_trials", type=int, default=20)
