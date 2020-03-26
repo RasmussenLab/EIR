@@ -283,7 +283,7 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
         scheduler=scheduler,
         search_alg=ax_search_algorithm,
         num_samples=cl_args.total_trials,
-        resources_per_trial={"gpu": 2},
+        resources_per_trial={"gpu": 0, "cpu": 1},
     )
     _analyse_ax_results(ax_client=ax_client)
 
