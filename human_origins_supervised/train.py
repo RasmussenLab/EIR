@@ -300,6 +300,9 @@ def _log_params(model: nn.Module) -> None:
 
 
 def main(cl_args: argparse.Namespace) -> None:
+
+    utils.configure_root_logger(run_name=cl_args.run_name)
+
     run_folder = _prepare_run_folder(cl_args.run_name)
 
     train_dataset, valid_dataset = datasets.set_up_datasets(cl_args=cl_args)
@@ -684,8 +687,6 @@ if __name__ == "__main__":
     )
 
     cur_cl_args = parser.parse_args()
-
-    utils.configure_root_logger(run_name=cur_cl_args.run_name)
 
     if cur_cl_args.valid_size > 1.0:
         cur_cl_args.valid_size = int(cur_cl_args.valid_size)
