@@ -1,12 +1,17 @@
 import argparse
+import atexit
 import uuid
 from argparse import Namespace
 from os.path import abspath
 from pathlib import Path
+from functools import partial
+from typing import Dict
 
 import numpy as np
 from aislib.misc_utils import get_logger
 from ax.core.experiment import Experiment
+from ax.core.base_trial import TrialStatus
+from ax.core.trial import BaseTrial
 from ax.modelbridge.base import ModelBridge
 from ax.modelbridge.random import RandomModelBridge
 from ax.plot.base import AxPlotConfig
@@ -119,12 +124,18 @@ SEARCH_SPACE = [
         "parameter_type": int,
     },
     {"name": "na_augment_perc", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
-    {"name": "na_augment_prob", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
+    {"name": "na_augment_prob", "type": "range", "bounds": [0.0, 1.0], "digits": 2},
     {"name": "fc_do", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
     {"name": "rb_do", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
     {"name": "kernel_width", "type": "range", "bounds": [2, 20], "parameter_type": int},
     {
         "name": "first_kernel_expansion",
+        "type": "range",
+        "bounds": [1, 6],
+        "parameter_type": int,
+    },
+    {
+        "name": "dilation_factor",
         "type": "range",
         "bounds": [1, 6],
         "parameter_type": int,
@@ -154,7 +165,9 @@ def _prep_train_cl_args_namespace(parametrization, output_folder: Path) -> Names
     """
     config_ = {**TRAIN_CL_BASE, **parametrization}
 
-    config_["sample_interval"] = int(32 / config_["batch_size"] * config_["sample_interval"])
+    config_["sample_interval"] = int(
+        32 / config_["batch_size"] * config_["sample_interval"]
+    )
 
     current_run_name = "test_run_" + str(uuid.uuid4())
     config_["run_name"] = str(output_folder / current_run_name)
@@ -238,8 +251,14 @@ def _analyse_ax_results(ax_client: AxClient) -> None:
 
 
 def _save_trials_plot(experiment_object: Experiment, outpath: Path):
+    """
+    We filter for completed trials only in case the program is terminated only. We do
+    not want uncompleted trials to be considered because their objective_mean is None.
+    """
+    completed_trials = _get_completed_ax_trials(trials=experiment_object.trials)
+
     best_objectives = np.array(
-        [[trial.objective_mean * 100 for trial in experiment_object.trials.values()]]
+        [[trial.objective_mean * 100 for trial in completed_trials.values()]]
     )
     best_objective_plot = optimization_trace_single_method(
         y=np.maximum.accumulate(best_objectives, axis=1),
@@ -248,6 +267,14 @@ def _save_trials_plot(experiment_object: Experiment, outpath: Path):
     )
 
     _save_plot_from_ax_plot_config(plot_config=best_objective_plot, outpath=outpath)
+
+
+def _get_completed_ax_trials(trials: Dict[int, BaseTrial]):
+    completed_trials = {
+        k: v for k, v in trials.items() if v.status == TrialStatus.COMPLETED
+    }
+
+    return completed_trials
 
 
 def _save_slice_plot(
@@ -273,6 +300,8 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
     experiment_func = get_experiment_func(output_folder=Path("hyperopt"))
 
     ax_client, ax_search_algorithm = _get_search_algorithm()
+    atexit.register(partial(_analyse_ax_results, ax_client=ax_client))
+
     scheduler = _get_scheduler()
 
     loggers = [i for i in DEFAULT_LOGGERS if i != TBXLogger]
@@ -285,7 +314,6 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
         num_samples=cl_args.total_trials,
         resources_per_trial={"gpu": 0, "cpu": 1},
     )
-    _analyse_ax_results(ax_client=ax_client)
 
     return run_analysis
 
