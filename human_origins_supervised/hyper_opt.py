@@ -104,7 +104,7 @@ SEARCH_SPACE = [
         "log_scale": True,
         "digits": 5,
     },
-    {"name": "lr_schedule", "type": "choice", "values": ["cycle", "plateau", "same"]},
+    {"name": "lr_schedule", "type": "choice", "values": ["cycle", "plateau"]},
     {"name": "optimizer", "type": "choice", "values": ["adamw", "sgdm"]},
     {
         "name": "fc_repr_dim",
@@ -118,10 +118,10 @@ SEARCH_SPACE = [
         "bounds": [32, 128],
         "parameter_type": int,
     },
-    {"name": "na_augment_perc", "type": "range", "bounds": [0.0, 0.9], "digits": 2},
-    {"name": "na_augment_prob", "type": "range", "bounds": [0.0, 1.0], "digits": 2},
-    {"name": "fc_do", "type": "range", "bounds": [0.0, 0.9], "digits": 2},
-    {"name": "rb_do", "type": "range", "bounds": [0.0, 0.9], "digits": 2},
+    {"name": "na_augment_perc", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
+    {"name": "na_augment_prob", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
+    {"name": "fc_do", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
+    {"name": "rb_do", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
     {"name": "kernel_width", "type": "range", "bounds": [2, 20], "parameter_type": int},
     {
         "name": "first_kernel_expansion",
@@ -139,10 +139,10 @@ SEARCH_SPACE = [
     {
         "name": "channel_exp_base",
         "type": "range",
-        "bounds": [2, 6],
+        "bounds": [2, 7],
         "parameter_type": int,
     },
-    {"name": "wd", "type": "range", "bounds": [1e-5, 1e-1]},
+    {"name": "wd", "type": "range", "bounds": [1e-5, 1e-1], "log_scale": True},
     {"name": "sa", "type": "choice", "values": [True, False]},
 ]
 
@@ -154,7 +154,7 @@ def _prep_train_cl_args_namespace(parametrization, output_folder: Path) -> Names
     """
     config_ = {**TRAIN_CL_BASE, **parametrization}
 
-    config_["sample_interval"] = int(32 / config_["batch_size"] * 100)
+    config_["sample_interval"] = int(32 / config_["batch_size"] * config_["sample_interval"])
 
     current_run_name = "test_run_" + str(uuid.uuid4())
     config_["run_name"] = str(output_folder / current_run_name)
@@ -213,7 +213,7 @@ def _get_scheduler():
         time_attr="training_iteration",
         metric="best_average_performance",
         mode="max",
-        grace_period=1,
+        grace_period=10,
     )
     return scheduler
 
