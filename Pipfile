@@ -19,6 +19,7 @@ black = "==19.10b0"
 pre-commit = "*"
 gpustat = "*"
 pyinstaller = "*"
+v = {version = "*",editable = true}
 
 [packages]
 pandas = "*"
@@ -34,7 +35,7 @@ scikit-learn = "*"
 human-origins-supervised = {path = ".",editable = true}
 shap = "==0.34.0"
 seaborn = "*"
-aislib = {ref = "dev",git = "ssh://git@github.com/arnor-sigurdsson/aislib.git",editable = true}
+aislib = {editable = true,git = "ssh://git@github.com/arnor-sigurdsson/aislib.git",ref = "dev"}
 joblib = "*"
 lr-finder = {git = "ssh://git@github.com/arnor-sigurdsson/lr-finder.git",editable = true}
 tensorboard = "*"
