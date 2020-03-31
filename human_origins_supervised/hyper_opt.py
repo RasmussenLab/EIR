@@ -51,6 +51,7 @@ TRAIN_CL_BASE = {
     "data_width": 1000,
     "debug": False,
     "device": "cuda:0" if cuda.is_available() else "cpu",
+    "dilation_factor": 1,
     "down_stride": 4,
     "extra_cat_columns": [],
     "early_stopping": False,
@@ -80,7 +81,7 @@ TRAIN_CL_BASE = {
     "plot_skip_steps": 50,
     "rb_do": 0.0,
     "resblocks": None,
-    "run_name": "test_run",
+    "run_name": "hyperopt_trial",
     "sa": False,
     "snp_file": abspath(
         "data/1240k_HO_2019/processed/parsed_files/2000/data_final.snp"
@@ -158,7 +159,7 @@ SEARCH_SPACE = [
 ]
 
 
-def _prep_train_cl_args_namespace(parametrization, output_folder: Path) -> Namespace:
+def _prep_train_cl_args_namespace(parametrization) -> Namespace:
     """
     We update the sample interval to make sure we sample based on number of samples
     seen.
@@ -169,19 +170,17 @@ def _prep_train_cl_args_namespace(parametrization, output_folder: Path) -> Names
         32 / config_["batch_size"] * config_["sample_interval"]
     )
 
-    current_run_name = "test_run_" + str(uuid.uuid4())
-    config_["run_name"] = str(output_folder / current_run_name)
+    current_run_name = config_["run_name"] + "_" + str(uuid.uuid4())
+    config_["run_name"] = current_run_name
 
     cl_args = Namespace(**config_)
 
     return cl_args
 
 
-def get_experiment_func(output_folder: Path):
+def get_experiment_func():
     def run_experiment(parametrization):
-        train_cl_args = _prep_train_cl_args_namespace(
-            parametrization=parametrization, output_folder=output_folder
-        )
+        train_cl_args = _prep_train_cl_args_namespace(parametrization=parametrization)
 
         train.main(cl_args=train_cl_args)
 
@@ -205,17 +204,28 @@ def get_experiment_func(output_folder: Path):
     return run_experiment
 
 
-def _get_search_algorithm():
+def _get_search_algorithm(output_folder: Path):
     client = AxClient(enforce_sequential_optimization=False)
-    client.create_experiment(
-        name="hyperopt_experiment",
-        parameters=SEARCH_SPACE,
-        objective_name="best_average_performance",
-        parameter_constraints=[
-            "first_stride_expansion <= first_kernel_expansion",
-            "down_stride <= kernel_width",
-        ],
-    )
+
+    snapshot_path = output_folder / "ax_client_snapshot.json"
+    if snapshot_path.exists():
+        logger.info(
+            "Found snapshot file %s, resuming hyperoptimization from previous state.",
+            snapshot_path,
+        )
+        client = client.load_from_json_file(filepath=str(snapshot_path))
+
+    else:
+        client.create_experiment(
+            name="hyperopt_experiment",
+            parameters=SEARCH_SPACE,
+            objective_name="best_average_performance",
+            parameter_constraints=[
+                "first_stride_expansion <= first_kernel_expansion",
+                "down_stride <= kernel_width",
+            ],
+        )
+
     search_algorithm = AxSearch(client, max_concurrent=8)
 
     return client, search_algorithm
@@ -231,10 +241,16 @@ def _get_scheduler():
     return scheduler
 
 
-def _analyse_ax_results(ax_client: AxClient) -> None:
+def _hyperopt_run_finalizer(ax_client: AxClient, output_folder: Path) -> None:
+    _analyse_ax_results(ax_client=ax_client, output_folder=output_folder)
+
+    snapshot_outpath = output_folder / "ax_client_snapshot.json"
+    ax_client.save_to_json_file(filepath=str(snapshot_outpath))
+
+
+def _analyse_ax_results(ax_client: AxClient, output_folder: Path) -> None:
     _save_trials_plot(
-        experiment_object=ax_client.experiment,
-        outpath=Path("runs/hyperopt/trials.html"),
+        experiment_object=ax_client.experiment, outpath=output_folder / "trials.html"
     )
 
     model = ax_client.generation_strategy.model
@@ -242,11 +258,12 @@ def _analyse_ax_results(ax_client: AxClient) -> None:
         for param in SEARCH_SPACE:
             if param["type"] == "range":
                 param_name = param["name"]
+                cur_outpath = output_folder / f"{param_name}_slice.html"
                 _save_slice_plot(
                     model_object=model,
                     parameter_name=param_name,
                     metric_name="best_average_performance",
-                    outpath=Path(f"runs/hyperopt/{param_name}_slice.html"),
+                    outpath=cur_outpath,
                 )
 
 
@@ -297,17 +314,22 @@ def _save_plot_from_ax_plot_config(plot_config: AxPlotConfig, outpath: Path) -> 
 
 
 def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
-    experiment_func = get_experiment_func(output_folder=Path("hyperopt"))
+    output_folder = Path(cl_args.output_folder)
+    experiment_func = get_experiment_func()
 
-    ax_client, ax_search_algorithm = _get_search_algorithm()
-    atexit.register(partial(_analyse_ax_results, ax_client=ax_client))
+    ax_client, ax_search_algorithm = _get_search_algorithm(output_folder=output_folder)
+    atexit.register(
+        partial(
+            _hyperopt_run_finalizer, ax_client=ax_client, output_folder=output_folder
+        )
+    )
 
     scheduler = _get_scheduler()
 
     loggers = [i for i in DEFAULT_LOGGERS if i != TBXLogger]
     run_analysis = tune.run(
         run_or_experiment=experiment_func,
-        local_dir=Path("runs/hyperopt"),
+        local_dir=Path(cl_args.output_folder),
         loggers=loggers,
         scheduler=scheduler,
         search_alg=ax_search_algorithm,
@@ -322,6 +344,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--total_trials", type=int, default=20)
+
+    parser.add_argument("--output_folder", type=str, required=True)
 
     cur_cl_args = parser.parse_args()
 
