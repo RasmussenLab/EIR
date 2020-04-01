@@ -20,6 +20,7 @@ from human_origins_supervised.visualization import visualization_funcs as vf
 
 if TYPE_CHECKING:
     from human_origins_supervised.train_utils.train_handlers import HandlerConfig
+    from human_origins_supervised.train_utils.metrics import al_step_metric_dict
     from human_origins_supervised.train import Config
 
 logger = get_logger(name=__name__, tqdm_compatible=True)
@@ -72,9 +73,8 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
         loss=val_loss_avg.item(),
     )
 
-    tune.track.log(
-        best_average_performance=eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
-    )
+    _log_metrics_to_tune(eval_metrics_dict_w_avgs=eval_metrics_dict_w_avgs)
+
     write_eval_header = True if iteration == cl_args.sample_interval else False
     metrics.persist_metrics(
         handler_config=handler_config,
@@ -91,6 +91,12 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
         iteration=iteration,
         config=handler_config.config,
     )
+
+
+def _log_metrics_to_tune(eval_metrics_dict_w_avgs: "al_step_metric_dict"):
+    best_average_performance = eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
+    if hasattr(tune, "track"):
+        tune.track.log(best_average_performance=best_average_performance)
 
 
 def save_evaluation_results_wrapper(
