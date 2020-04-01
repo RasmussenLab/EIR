@@ -3,9 +3,10 @@ import atexit
 import uuid
 from argparse import Namespace
 from os.path import abspath
+from os import cpu_count
 from pathlib import Path
 from functools import partial
-from typing import Dict
+from typing import Dict, Any, List
 
 import numpy as np
 from aislib.misc_utils import get_logger
@@ -204,7 +205,9 @@ def get_experiment_func():
     return run_experiment
 
 
-def _get_search_algorithm(output_folder: Path):
+def _get_search_algorithm(
+    output_folder: Path, num_gpus_per_trial: int, num_cpus_per_trial: int
+):
     client = AxClient(enforce_sequential_optimization=False)
 
     snapshot_path = output_folder / "ax_client_snapshot.json"
@@ -216,27 +219,72 @@ def _get_search_algorithm(output_folder: Path):
         client = client.load_from_json_file(filepath=str(snapshot_path))
 
     else:
+        parameter_constraints = _get_parameter_constraints(search_space=SEARCH_SPACE)
         client.create_experiment(
             name="hyperopt_experiment",
             parameters=SEARCH_SPACE,
             objective_name="best_average_performance",
-            parameter_constraints=[
-                "first_stride_expansion <= first_kernel_expansion",
-                "down_stride <= kernel_width",
-            ],
+            minimize=False,
+            parameter_constraints=parameter_constraints,
         )
 
-    search_algorithm = AxSearch(client, max_concurrent=8)
+    max_concurrent = _get_max_concurrent_runs(
+        gpus_per_trial=num_gpus_per_trial, cpus_per_trial=num_cpus_per_trial
+    )
+    search_algorithm = AxSearch(client, max_concurrent=max_concurrent)
 
     return client, search_algorithm
 
 
-def _get_scheduler():
+def _get_parameter_constraints(search_space: List[Dict[str, Any]],):
+    constraints = []
+    hparams = [i["name"] for i in search_space]
+    if "down_stride" in hparams and "kernel_width" in hparams:
+        constraints.append("down_stride <= kernel_width")
+
+    if "first_stride_expansion" in hparams and "first_kernel_expansion" in hparams:
+        constraints.append("first_stride_expansion <= first_kernel_expansion")
+
+    return constraints
+
+
+def _get_max_concurrent_runs(gpus_per_trial: int, cpus_per_trial: int):
+    num_cpus_total = cpu_count()
+    max_concurrent_on_cpus = min(num_cpus_total // cpus_per_trial, 10)
+
+    if gpus_per_trial == 0:
+        logger.debug(
+            "No GPUs allocated to each trial. Max concurrent trials set to %d"
+            " based on %d available CPUs with %d CPUs per trial. Hardcoded max is 10.",
+            max_concurrent_on_cpus,
+            num_cpus_total,
+            cpus_per_trial,
+        )
+        return max_concurrent_on_cpus
+
+    num_gpus_total = cuda.device_count()
+    max_concurrent_on_gpus = num_gpus_total // gpus_per_trial
+
+    concurrent_bottleneck = min(max_concurrent_on_cpus, max_concurrent_on_gpus)
+    logger.debug(
+        "Max concurrent trials set to %d based on %d available GPUs with %d GPUs "
+        "per trial and %d available CPUs with %d CPUs per trial. Harcoded max is 10.",
+        concurrent_bottleneck,
+        num_gpus_total,
+        gpus_per_trial,
+        num_cpus_total,
+        cpus_per_trial,
+    )
+
+    return concurrent_bottleneck
+
+
+def _get_scheduler(grace_period: int):
     scheduler = ASHAScheduler(
         time_attr="training_iteration",
         metric="best_average_performance",
         mode="max",
-        grace_period=10,
+        grace_period=grace_period,
     )
     return scheduler
 
@@ -317,14 +365,18 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
     output_folder = Path(cl_args.output_folder)
     experiment_func = get_experiment_func()
 
-    ax_client, ax_search_algorithm = _get_search_algorithm(output_folder=output_folder)
+    ax_client, ax_search_algorithm = _get_search_algorithm(
+        output_folder=output_folder,
+        num_gpus_per_trial=cl_args.n_gpus_per_trial,
+        num_cpus_per_trial=cl_args.n_cpus_per_trial,
+    )
     atexit.register(
         partial(
             _hyperopt_run_finalizer, ax_client=ax_client, output_folder=output_folder
         )
     )
 
-    scheduler = _get_scheduler()
+    scheduler = _get_scheduler(grace_period=cl_args.scheduler_grace_period)
 
     loggers = [i for i in DEFAULT_LOGGERS if i != TBXLogger]
     run_analysis = tune.run(
@@ -334,10 +386,21 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
         scheduler=scheduler,
         search_alg=ax_search_algorithm,
         num_samples=cl_args.total_trials,
-        resources_per_trial={"gpu": 0, "cpu": 1},
+        resources_per_trial={
+            "gpu": cl_args.n_gpus_per_trial,
+            "cpu": cl_args.n_cpus_per_trial,
+        },
     )
 
     return run_analysis
+
+
+def _parse_cl_args(cl_args: Namespace) -> Namespace:
+    if cuda.device_count() == 0:
+        logger.debug("Setting n_gpus_per_trial to 0 since device cound is 0.")
+        cl_args.n_gpus_per_trial = 0
+
+    return cl_args
 
 
 if __name__ == "__main__":
@@ -345,8 +408,16 @@ if __name__ == "__main__":
 
     parser.add_argument("--total_trials", type=int, default=20)
 
+    parser.add_argument("--n_gpus_per_trial", type=int, default=1)
+
+    parser.add_argument("--n_cpus_per_trial", type=int, default=8)
+
+    parser.add_argument("--scheduler_grace_period", type=int, default=10)
+
     parser.add_argument("--output_folder", type=str, required=True)
 
     cur_cl_args = parser.parse_args()
 
-    analysis = run_hyperopt(cl_args=cur_cl_args)
+    parsed_cl_args = _parse_cl_args(cl_args=cur_cl_args)
+
+    analysis = run_hyperopt(cl_args=parsed_cl_args)
