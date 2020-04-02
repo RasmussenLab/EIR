@@ -43,13 +43,10 @@ TRAIN_CL_BASE = {
     "b2": 0.999,
     "batch_size": 32,
     "channel_exp_base": 5,
-    "checkpoint_interval": 100,
+    "checkpoint_interval": 10000,
     "extra_con_columns": [],
     "custom_lib": None,
-    "data_folder": abspath(
-        "data/1240k_HO_2019/processed/encoded_outputs_uint8/2000/train/"
-    ),
-    "data_width": 1000,
+    "data_folder": abspath("None"),
     "debug": False,
     "device": "cuda:0" if cuda.is_available() else "cpu",
     "dilation_factor": 1,
@@ -66,7 +63,7 @@ TRAIN_CL_BASE = {
     "get_acts": False,
     "gpu_num": "0",
     "kernel_width": 12,
-    "label_file": abspath("data/1240k_HO_2019/processed/labels/labels_2000.csv"),
+    "label_file": abspath("None"),
     "lr": 1e-2,
     "lr_lb": 1e-5,
     "lr_schedule": "plateau",
@@ -75,7 +72,7 @@ TRAIN_CL_BASE = {
     "multi_gpu": False,
     "no_pbar": True,
     "n_cpu": 8,
-    "n_epochs": 8,
+    "n_epochs": 20,
     "na_augment_perc": 0.0,
     "na_augment_prob": 0.0,
     "optimizer": "adamw",
@@ -84,13 +81,11 @@ TRAIN_CL_BASE = {
     "resblocks": None,
     "run_name": "hyperopt_trial",
     "sa": False,
-    "snp_file": abspath(
-        "data/1240k_HO_2019/processed/parsed_files/2000/data_final.snp"
-    ),
-    "sample_interval": 100,
-    "target_cat_columns": ["Origin"],
+    "snp_file": None,
+    "sample_interval": 200,
+    "target_cat_columns": ["None"],
     "target_con_columns": [],
-    "target_width": 1000,
+    "target_width": None,
     "valid_size": 0.05,
     "warmup_steps": 144,
     "wd": 0.00,
@@ -98,12 +93,7 @@ TRAIN_CL_BASE = {
 }
 
 SEARCH_SPACE = [
-    {
-        "name": "batch_size",
-        "type": "choice",
-        "values": [16, 32, 64],
-        "is_ordered": True,
-    },
+    {"name": "batch_size", "type": "choice", "values": [16, 32], "is_ordered": True},
     {
         "name": "lr",
         "type": "range",
