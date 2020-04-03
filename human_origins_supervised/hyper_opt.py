@@ -87,7 +87,7 @@ TRAIN_CL_BASE = {
     "target_con_columns": [],
     "target_width": None,
     "valid_size": 0.05,
-    "warmup_steps": 144,
+    "warmup_steps": "auto",
     "wd": 0.00,
     "weighted_sampling_column": None,
 }
