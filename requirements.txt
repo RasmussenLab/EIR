@@ -15,6 +15,7 @@ cffi==1.14.0
 chardet==3.0.4
 click==7.1.1
 colorama==0.4.3
+configargparse==1.2
 cycler==0.10.0
 dask[array,dataframe]==2.14.0
 deprecated==1.2.8

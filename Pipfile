@@ -43,6 +43,7 @@ ax-platform = "==0.1.6"
 ray = {extras = ["tune"],version = "*"}
 botorch = "==0.1.4"
 sqlalchemy = "*"
+configargparse = "*"
 
 [requires]
 python_version = "3.7"
