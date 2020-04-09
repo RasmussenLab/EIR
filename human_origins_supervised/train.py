@@ -371,7 +371,7 @@ def train(config: Config) -> None:
     trainer.run(data=c.train_loader, max_epochs=cl_args.n_epochs)
 
 
-def _get_train_argument_parser() -> configargparse.ArgumentParser:
+def get_train_argument_parser() -> configargparse.ArgumentParser:
 
     parser_ = configargparse.ArgumentParser(
         config_file_parser_class=configargparse.YAMLConfigFileParser
@@ -641,7 +641,7 @@ def _get_train_argument_parser() -> configargparse.ArgumentParser:
     parser_.add_argument(
         "--sample_interval",
         type=int,
-        default=None,
+        default=1000,
         help="Epoch interval to sample generated seqs.",
     )
     parser_.add_argument(
@@ -713,7 +713,7 @@ def _get_train_argument_parser() -> configargparse.ArgumentParser:
     return parser_
 
 
-def _modify_train_arguments(cl_args: argparse.Namespace) -> argparse.Namespace:
+def modify_train_arguments(cl_args: argparse.Namespace) -> argparse.Namespace:
     if cl_args.valid_size > 1.0:
         cl_args.valid_size = int(cl_args.valid_size)
 
@@ -735,9 +735,9 @@ def _modify_train_arguments(cl_args: argparse.Namespace) -> argparse.Namespace:
 
 if __name__ == "__main__":
 
-    parser = _get_train_argument_parser()
+    parser = get_train_argument_parser()
     cur_cl_args = parser.parse_args()
-    cur_cl_args = _modify_train_arguments(cl_args=cur_cl_args)
+    cur_cl_args = modify_train_arguments(cl_args=cur_cl_args)
 
     utils.configure_root_logger(run_name=cur_cl_args.run_name)
 

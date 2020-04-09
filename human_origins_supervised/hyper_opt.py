@@ -37,60 +37,6 @@ from human_origins_supervised.train_utils.utils import get_run_folder
 
 logger = get_logger(name=__name__, tqdm_compatible=True)
 
-TRAIN_CL_BASE = {
-    "act_classes": None,
-    "b1": 0.9,
-    "b2": 0.999,
-    "batch_size": 32,
-    "channel_exp_base": 5,
-    "checkpoint_interval": 10000,
-    "extra_con_columns": [],
-    "custom_lib": None,
-    "data_folder": abspath("None"),
-    "debug": False,
-    "device": "cuda:0" if cuda.is_available() else "cpu",
-    "dilation_factor": 1,
-    "down_stride": 4,
-    "extra_cat_columns": [],
-    "early_stopping": False,
-    "fc_repr_dim": 64,
-    "fc_task_dim": 32,
-    "fc_do": 0.0,
-    "find_lr": False,
-    "first_kernel_expansion": 1,
-    "first_stride_expansion": 1,
-    "first_channel_expansion": 1,
-    "get_acts": False,
-    "gpu_num": "0",
-    "kernel_width": 12,
-    "label_file": abspath("None"),
-    "lr": 1e-2,
-    "lr_lb": 1e-5,
-    "lr_schedule": "plateau",
-    "memory_dataset": False,
-    "model_type": "cnn",
-    "multi_gpu": False,
-    "no_pbar": True,
-    "n_cpu": 8,
-    "n_epochs": 20,
-    "na_augment_perc": 0.0,
-    "na_augment_prob": 0.0,
-    "optimizer": "adamw",
-    "plot_skip_steps": 50,
-    "rb_do": 0.0,
-    "resblocks": None,
-    "run_name": "hyperopt_trial",
-    "sa": False,
-    "snp_file": None,
-    "sample_interval": 200,
-    "target_cat_columns": ["None"],
-    "target_con_columns": [],
-    "target_width": None,
-    "valid_size": 0.05,
-    "warmup_steps": "auto",
-    "wd": 0.00,
-    "weighted_sampling_column": None,
-}
 
 SEARCH_SPACE = [
     {"name": "batch_size", "type": "choice", "values": [16, 32], "is_ordered": True},
@@ -150,28 +96,48 @@ SEARCH_SPACE = [
 ]
 
 
-def _prep_train_cl_args_namespace(parametrization) -> Namespace:
-    """
-    We update the sample interval to make sure we sample based on number of samples
-    seen.
-    """
-    config_ = {**TRAIN_CL_BASE, **parametrization}
-
-    config_["sample_interval"] = int(
-        32 / config_["batch_size"] * config_["sample_interval"]
+def _get_default_train_cl_args(train_config_file_for_hyperopt: str) -> Namespace:
+    train_argument_parser = train.get_train_argument_parser()
+    cl_args_base = train_argument_parser.parse_args(
+        args=["--config_file", abspath(train_config_file_for_hyperopt)]
     )
+    cl_args_base = train.modify_train_arguments(cl_args=cl_args_base)
+    setattr(cl_args_base, "no_pbar", True)
 
-    current_run_name = config_["run_name"] + "_" + str(uuid.uuid4())
-    config_["run_name"] = current_run_name
+    base_cl_args_with_abspaths = _convert_filepaths_to_abspaths(cl_args=cl_args_base)
+    return base_cl_args_with_abspaths
 
-    cl_args = Namespace(**config_)
+
+def _convert_filepaths_to_abspaths(cl_args: Namespace) -> Namespace:
+    """
+    This is needed since ray is in a different context.
+    """
+    keys = ["custom_lib", "snp_file", "data_folder", "label_file"]
+
+    for file_key in keys:
+        cur_file_path = getattr(cl_args, file_key)
+
+        if cur_file_path is not None:
+            if not Path(cur_file_path).exists():
+                raise FileNotFoundError(f"Could not find file: {cur_file_path}")
+
+            setattr(cl_args, file_key, abspath(cur_file_path))
 
     return cl_args
 
 
-def get_experiment_func():
+def get_experiment_func(train_config_file_for_hyperopt: str):
+    """
+    The abspath is needed since ray creates its own context.
+    """
+    train_cl_args_base = _get_default_train_cl_args(
+        train_config_file_for_hyperopt=abspath(train_config_file_for_hyperopt)
+    )
+
     def run_experiment(parametrization):
-        train_cl_args = _prep_train_cl_args_namespace(parametrization=parametrization)
+        train_cl_args = _parametrize_base_cl_args(
+            train_cl_args_base=train_cl_args_base, parametrization=parametrization
+        )
 
         train.main(cl_args=train_cl_args)
 
@@ -193,6 +159,27 @@ def get_experiment_func():
         return best_performance
 
     return run_experiment
+
+
+def _parametrize_base_cl_args(
+    train_cl_args_base: Namespace, parametrization: Dict
+) -> Namespace:
+    """
+    We update the sample interval to make sure we sample based on number of samples
+    seen.
+    """
+    config_ = {**vars(train_cl_args_base), **parametrization}
+
+    config_["sample_interval"] = int(
+        32 / config_["batch_size"] * config_["sample_interval"]
+    )
+
+    current_run_name = config_["run_name"] + "_" + str(uuid.uuid4())
+    config_["run_name"] = current_run_name
+
+    cl_args = Namespace(**config_)
+
+    return cl_args
 
 
 def _get_search_algorithm(
@@ -353,7 +340,9 @@ def _save_plot_from_ax_plot_config(plot_config: AxPlotConfig, outpath: Path) -> 
 
 def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
     output_folder = Path(cl_args.output_folder)
-    experiment_func = get_experiment_func()
+    experiment_func = get_experiment_func(
+        train_config_file_for_hyperopt=abspath(cl_args.train_config_file)
+    )
 
     ax_client, ax_search_algorithm = _get_search_algorithm(
         output_folder=output_folder,
@@ -387,7 +376,7 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
 
 def _parse_cl_args(cl_args: Namespace) -> Namespace:
     if cuda.device_count() == 0:
-        logger.debug("Setting n_gpus_per_trial to 0 since device cound is 0.")
+        logger.debug("Setting n_gpus_per_trial to 0 since device count is 0.")
         cl_args.n_gpus_per_trial = 0
 
     return cl_args
@@ -403,6 +392,16 @@ if __name__ == "__main__":
     parser.add_argument("--n_cpus_per_trial", type=int, default=8)
 
     parser.add_argument("--scheduler_grace_period", type=int, default=10)
+
+    parser.add_argument(
+        "--train_config_file",
+        type=str,
+        required=True,
+        help="path to .yaml file specifying experiment specific settings to be used "
+        "as CL arguments to train.py. This needs to contain at least data_folder, "
+        "label_file, run_name and target column (con and/or cat) arguments as "
+        "specified in train.py.",
+    )
 
     parser.add_argument("--output_folder", type=str, required=True)
 
