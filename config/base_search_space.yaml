@@ -1,0 +1,122 @@
+- name: batch_size
+  type: choice
+  values:
+  - 16
+  - 32
+  is_ordered: true
+
+- name: lr
+  type: range
+  bounds:
+  - 1.0e-05
+  - 0.5
+  log_scale: true
+  digits: 5
+
+- name: lr_schedule
+  type: choice
+  values:
+  - cycle
+  - plateau
+
+- name: optimizer
+  type: choice
+  values:
+  - adamw
+  - sgdm
+
+- name: fc_repr_dim
+  type: range
+  bounds:
+  - 32
+  - 512
+  parameter_type: &int_python_primitive !!python/name:builtins.int ''
+
+- name: fc_task_dim
+  type: range
+  bounds:
+  - 32
+  - 128
+  parameter_type: *int_python_primitive
+
+- name: na_augment_perc
+  type: range
+  bounds:
+  - 0.0
+  - 0.5
+  digits: 2
+
+- name: na_augment_prob
+  type: range
+  bounds:
+  - 0.0
+  - 1.0
+  digits: 2
+
+- name: fc_do
+  type: range
+  bounds:
+  - 0.0
+  - 0.5
+  digits: 2
+
+- name: rb_do
+  type: range
+  bounds:
+  - 0.0
+  - 0.5
+  digits: 2
+
+- name: kernel_width
+  type: range
+  bounds:
+  - 2
+  - 20
+  parameter_type: *int_python_primitive
+
+- name: first_kernel_expansion
+  type: range
+  bounds:
+  - 1
+  - 6
+  parameter_type: *int_python_primitive
+
+- name: dilation_factor
+  type: range
+  bounds:
+  - 1
+  - 6
+  parameter_type: *int_python_primitive
+
+- name: first_stride_expansion
+  type: range
+  bounds:
+  - 1
+  - 2
+  parameter_type: *int_python_primitive
+
+- name: down_stride
+  type: range
+  bounds:
+  - 2
+  - 10
+
+- name: channel_exp_base
+  type: range
+  bounds:
+  - 2
+  - 7
+  parameter_type: *int_python_primitive
+
+- name: wd
+  type: range
+  bounds:
+  - 1.0e-05
+  - 0.1
+  log_scale: true
+
+- name: sa
+  type: choice
+  values:
+  - true
+  - false

@@ -2,7 +2,7 @@
 alabaster==0.7.12
 altgraph==0.17
 appdirs==1.4.3
-appnope==0.1.0 ; platform_system == 'Darwin'
+appnope==0.1.0 ; sys_platform == 'darwin'
 attrs==19.3.0
 babel==2.8.0
 backcall==0.1.0

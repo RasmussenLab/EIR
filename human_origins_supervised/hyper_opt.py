@@ -2,17 +2,18 @@ import argparse
 import atexit
 import uuid
 from argparse import Namespace
-from os.path import abspath
-from os import cpu_count
-from pathlib import Path
 from functools import partial
-from typing import Dict, Any, List
+from os import cpu_count
+from os.path import abspath
+from pathlib import Path
+from typing import Dict, List, Union
 
 import numpy as np
 from aislib.misc_utils import get_logger
-from ax.core.experiment import Experiment
 from ax.core.base_trial import TrialStatus
+from ax.core.experiment import Experiment
 from ax.core.trial import BaseTrial
+from ax.core.types import TParamValue
 from ax.modelbridge.base import ModelBridge
 from ax.modelbridge.random import RandomModelBridge
 from ax.plot.base import AxPlotConfig
@@ -21,79 +22,25 @@ from ax.plot.trace import optimization_trace_single_method
 from ax.service.ax_client import AxClient
 from plotly import offline
 from ray import tune
+from ray.tune.analysis import ExperimentAnalysis
 from ray.tune.logger import DEFAULT_LOGGERS, TBXLogger
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.suggest.ax import AxSearch
-from ray.tune.analysis import ExperimentAnalysis
 from torch import cuda
+from yaml import load, Loader
 
-from human_origins_supervised.data_load.datasets import merge_target_columns
 from human_origins_supervised import train
+from human_origins_supervised.data_load.datasets import merge_target_columns
 from human_origins_supervised.train_utils.metrics import (
     get_best_average_performance,
     get_metrics_files,
 )
 from human_origins_supervised.train_utils.utils import get_run_folder
 
+# aliases
+al_search_space = List[Dict[str, Union[TParamValue, List[TParamValue]]]]
+
 logger = get_logger(name=__name__, tqdm_compatible=True)
-
-
-SEARCH_SPACE = [
-    {"name": "batch_size", "type": "choice", "values": [16, 32], "is_ordered": True},
-    {
-        "name": "lr",
-        "type": "range",
-        "bounds": [1e-5, 0.5],
-        "log_scale": True,
-        "digits": 5,
-    },
-    {"name": "lr_schedule", "type": "choice", "values": ["cycle", "plateau"]},
-    {"name": "optimizer", "type": "choice", "values": ["adamw", "sgdm"]},
-    {
-        "name": "fc_repr_dim",
-        "type": "range",
-        "bounds": [32, 512],
-        "parameter_type": int,
-    },
-    {
-        "name": "fc_task_dim",
-        "type": "range",
-        "bounds": [32, 128],
-        "parameter_type": int,
-    },
-    {"name": "na_augment_perc", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
-    {"name": "na_augment_prob", "type": "range", "bounds": [0.0, 1.0], "digits": 2},
-    {"name": "fc_do", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
-    {"name": "rb_do", "type": "range", "bounds": [0.0, 0.5], "digits": 2},
-    {"name": "kernel_width", "type": "range", "bounds": [2, 20], "parameter_type": int},
-    {
-        "name": "first_kernel_expansion",
-        "type": "range",
-        "bounds": [1, 6],
-        "parameter_type": int,
-    },
-    {
-        "name": "dilation_factor",
-        "type": "range",
-        "bounds": [1, 6],
-        "parameter_type": int,
-    },
-    {
-        "name": "first_stride_expansion",
-        "type": "range",
-        "bounds": [1, 2],
-        "parameter_type": int,
-    },
-    {"name": "down_stride", "type": "range", "bounds": [2, 10]},
-    {
-        "name": "channel_exp_base",
-        "type": "range",
-        "bounds": [2, 7],
-        "parameter_type": int,
-    },
-    {"name": "wd", "type": "range", "bounds": [1e-5, 1e-1], "log_scale": True},
-    {"name": "sa", "type": "choice", "values": [True, False]},
-]
 
 
 def _get_default_train_cl_args(train_config_file_for_hyperopt: str) -> Namespace:
@@ -183,7 +130,10 @@ def _parametrize_base_cl_args(
 
 
 def _get_search_algorithm(
-    output_folder: Path, num_gpus_per_trial: int, num_cpus_per_trial: int
+    search_space: al_search_space,
+    output_folder: Path,
+    num_gpus_per_trial: int,
+    num_cpus_per_trial: int,
 ):
     client = AxClient(enforce_sequential_optimization=False)
 
@@ -196,10 +146,10 @@ def _get_search_algorithm(
         client = client.load_from_json_file(filepath=str(snapshot_path))
 
     else:
-        parameter_constraints = _get_parameter_constraints(search_space=SEARCH_SPACE)
+        parameter_constraints = _get_parameter_constraints(search_space=search_space)
         client.create_experiment(
             name="hyperopt_experiment",
-            parameters=SEARCH_SPACE,
+            parameters=search_space,
             objective_name="best_average_performance",
             minimize=False,
             parameter_constraints=parameter_constraints,
@@ -213,7 +163,7 @@ def _get_search_algorithm(
     return client, search_algorithm
 
 
-def _get_parameter_constraints(search_space: List[Dict[str, Any]],):
+def _get_parameter_constraints(search_space: al_search_space):
     constraints = []
     hparams = [i["name"] for i in search_space]
     if "down_stride" in hparams and "kernel_width" in hparams:
@@ -266,21 +216,27 @@ def _get_scheduler(grace_period: int):
     return scheduler
 
 
-def _hyperopt_run_finalizer(ax_client: AxClient, output_folder: Path) -> None:
-    _analyse_ax_results(ax_client=ax_client, output_folder=output_folder)
+def _hyperopt_run_finalizer(
+    ax_client: AxClient, output_folder: Path, search_space: al_search_space
+) -> None:
+    _analyse_ax_results(
+        ax_client=ax_client, output_folder=output_folder, search_space=search_space
+    )
 
     snapshot_outpath = output_folder / "ax_client_snapshot.json"
     ax_client.save_to_json_file(filepath=str(snapshot_outpath))
 
 
-def _analyse_ax_results(ax_client: AxClient, output_folder: Path) -> None:
+def _analyse_ax_results(
+    ax_client: AxClient, output_folder: Path, search_space: al_search_space
+) -> None:
     _save_trials_plot(
         experiment_object=ax_client.experiment, outpath=output_folder / "trials.html"
     )
 
     model = ax_client.generation_strategy.model
     if not isinstance(model, RandomModelBridge):
-        for param in SEARCH_SPACE:
+        for param in search_space:
             if param["type"] == "range":
                 param_name = param["name"]
                 cur_outpath = output_folder / f"{param_name}_slice.html"
@@ -344,14 +300,21 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
         train_config_file_for_hyperopt=abspath(cl_args.train_config_file)
     )
 
+    search_space = _load_search_space_yaml_config(
+        search_space_config_file_path=cl_args.search_space_file
+    )
     ax_client, ax_search_algorithm = _get_search_algorithm(
+        search_space=search_space,
         output_folder=output_folder,
         num_gpus_per_trial=cl_args.n_gpus_per_trial,
         num_cpus_per_trial=cl_args.n_cpus_per_trial,
     )
     atexit.register(
         partial(
-            _hyperopt_run_finalizer, ax_client=ax_client, output_folder=output_folder
+            _hyperopt_run_finalizer,
+            ax_client=ax_client,
+            output_folder=output_folder,
+            search_space=search_space,
         )
     )
 
@@ -374,6 +337,16 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
     return run_analysis
 
 
+def _load_search_space_yaml_config(
+    search_space_config_file_path: str,
+) -> al_search_space:
+    stream = open(search_space_config_file_path, "r")
+    search_space = load(stream=stream, Loader=Loader)
+    breakpoint()
+
+    return search_space
+
+
 def _parse_cl_args(cl_args: Namespace) -> Namespace:
     if cuda.device_count() == 0:
         logger.debug("Setting n_gpus_per_trial to 0 since device count is 0.")
@@ -392,6 +365,14 @@ if __name__ == "__main__":
     parser.add_argument("--n_cpus_per_trial", type=int, default=8)
 
     parser.add_argument("--scheduler_grace_period", type=int, default=10)
+
+    parser.add_argument(
+        "--search_space_file",
+        type=str,
+        default="config/base_search_space.yaml",
+        help=".yaml file indicating the search space to use in the hyperparameter "
+        "optimization, follows ax-platform format",
+    )
 
     parser.add_argument(
         "--train_config_file",
