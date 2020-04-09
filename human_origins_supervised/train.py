@@ -628,7 +628,7 @@ def get_train_argument_parser() -> configargparse.ArgumentParser:
     parser_.add_argument(
         "--snp_file",
         type=str,
-        default="infer",
+        default=None,
         help="File to load SNPs from (.snp format).",
     )
 

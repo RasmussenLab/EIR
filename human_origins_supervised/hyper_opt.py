@@ -342,7 +342,6 @@ def _load_search_space_yaml_config(
 ) -> al_search_space:
     stream = open(search_space_config_file_path, "r")
     search_space = load(stream=stream, Loader=Loader)
-    breakpoint()
 
     return search_space
 
