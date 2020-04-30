@@ -1,3 +1,4 @@
+from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, TYPE_CHECKING
@@ -12,10 +13,17 @@ from scipy.special import softmax
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from human_origins_supervised.data_load.data_utils import get_target_columns_generator
-from human_origins_supervised.data_load.datasets import al_label_transformers_object
+from human_origins_supervised.data_load.datasets import (
+    al_label_transformers_object,
+    merge_target_columns,
+)
 from human_origins_supervised.models import model_utils
 from human_origins_supervised.train_utils import metrics
 from human_origins_supervised.train_utils import utils
+from human_origins_supervised.train_utils.metrics import (
+    get_best_overall_performance,
+    get_metrics_files,
+)
 from human_origins_supervised.visualization import visualization_funcs as vf
 
 if TYPE_CHECKING:
@@ -90,13 +98,35 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
         config=handler_config.config,
     )
 
-    _log_metrics_to_tune(eval_metrics_dict_w_avgs=eval_metrics_dict_w_avgs)
+    _log_metrics_to_tune(
+        eval_metrics_dict_w_avgs=eval_metrics_dict_w_avgs, cl_args=cl_args
+    )
 
 
-def _log_metrics_to_tune(eval_metrics_dict_w_avgs: "al_step_metric_dict",):
+def _log_metrics_to_tune(
+    eval_metrics_dict_w_avgs: "al_step_metric_dict", cl_args: Namespace
+):
+    """
+    TODO: Refactor below functionality in a wrapper potentially.
+    """
+    target_columns = merge_target_columns(
+        target_cat_columns=cl_args.target_cat_columns,
+        target_con_columns=cl_args.target_con_columns,
+    )
+    run_folder = utils.get_run_folder(run_name=cl_args.run_name)
+    metrics_files = get_metrics_files(
+        target_columns=target_columns, run_folder=run_folder, target_prefix="v_"
+    )
+
+    best_overall_performance = get_best_overall_performance(
+        val_metrics_files=metrics_files, target_columns=target_columns
+    )
     latest_average_performance = eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
     if hasattr(tune, "track"):
-        tune.track.log(latest_average_performance=latest_average_performance)
+        tune.track.log(
+            best_overall_performance=best_overall_performance,
+            latest_average_performance=latest_average_performance,
+        )
 
 
 def save_evaluation_results_wrapper(

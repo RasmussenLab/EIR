@@ -287,12 +287,20 @@ def _add_metrics_to_writer(
     iteration: int,
     writer: SummaryWriter,
     plot_skip_steps: int,
+    do_writing_divisor: int = 10,
 ) -> None:
     """
     We do %10 to reduce the amount of training data going to tensorboard, otherwise
     it slows down with many large experiments.
+
+    TODO:
+        Have better logic here – this can cause unexpected behavior where nothing
+        gets written for the evaluation parts if the sample interval is not divisible
+        by 10. Either remove the modulus or pass it in as an argument, then 10 for
+        training.
     """
-    if iteration >= plot_skip_steps and iteration % 10 == 0:
+
+    if iteration >= plot_skip_steps and iteration % do_writing_divisor == 0:
         for metric_name, metric_value in metric_dict.items():
             cur_name = name + f"/{metric_name}"
             writer.add_scalar(

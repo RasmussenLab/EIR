@@ -1,3 +1,4 @@
+import json
 import argparse
 import atexit
 import uuid
@@ -111,6 +112,7 @@ def _parametrize_base_cl_args(
 def _get_search_algorithm(
     search_space: al_search_space,
     output_folder: Path,
+    objective_name: str,
     num_gpus_per_trial: int,
     num_cpus_per_trial: int,
 ):
@@ -129,7 +131,7 @@ def _get_search_algorithm(
         client.create_experiment(
             name="hyperopt_experiment",
             parameters=search_space,
-            objective_name="average_performance",
+            objective_name=objective_name,
             minimize=False,
             parameter_constraints=parameter_constraints,
         )
@@ -140,6 +142,12 @@ def _get_search_algorithm(
     search_algorithm = AxSearch(client, max_concurrent=max_concurrent)
 
     return client, search_algorithm
+
+
+def get_objective_name_from_cl_argument(search_objective_cla: str):
+    if search_objective_cla == "best":
+        return "best_overall_performance"
+    return "latest_average_performance"
 
 
 def _get_parameter_constraints(search_space: al_search_space):
@@ -188,7 +196,7 @@ def _get_max_concurrent_runs(gpus_per_trial: int, cpus_per_trial: int):
 def _get_scheduler(grace_period: int):
     scheduler = ASHAScheduler(
         time_attr="training_iteration",
-        metric="average_performance",
+        metric="latest_average_performance",
         mode="max",
         grace_period=grace_period,
     )
@@ -196,18 +204,36 @@ def _get_scheduler(grace_period: int):
 
 
 def _hyperopt_run_finalizer(
-    ax_client: AxClient, output_folder: Path, search_space: al_search_space
+    ax_client: AxClient,
+    output_folder: Path,
+    search_space: al_search_space,
+    objective_name: str,
 ) -> None:
+    """
+    TODO: Convert arguments to this function to object.
+    """
     _analyse_ax_results(
-        ax_client=ax_client, output_folder=output_folder, search_space=search_space
+        ax_client=ax_client,
+        output_folder=output_folder,
+        search_space=search_space,
+        objective_name=objective_name,
     )
 
     snapshot_outpath = output_folder / "ax_client_snapshot.json"
     ax_client.save_to_json_file(filepath=str(snapshot_outpath))
 
+    best_result_outpath = output_folder / "best_parameters.json"
+    best_params, values = ax_client.get_best_parameters()
+    result_dict = {"best_params": best_params, "best_params_performance": values}
+    with open(str(best_result_outpath), "w") as best_param_outpath:
+        json.dump(result_dict, best_param_outpath, sort_keys=True, indent=4)
+
 
 def _analyse_ax_results(
-    ax_client: AxClient, output_folder: Path, search_space: al_search_space
+    ax_client: AxClient,
+    output_folder: Path,
+    search_space: al_search_space,
+    objective_name: str,
 ) -> None:
     _save_trials_plot(
         experiment_object=ax_client.experiment, outpath=output_folder / "trials.html"
@@ -222,7 +248,7 @@ def _analyse_ax_results(
                 _save_slice_plot(
                     model_object=model,
                     parameter_name=param_name,
-                    metric_name="average_performance",
+                    metric_name=objective_name,
                     outpath=cur_outpath,
                 )
 
@@ -275,6 +301,7 @@ def _save_plot_from_ax_plot_config(plot_config: AxPlotConfig, outpath: Path) -> 
 
 def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
     output_folder = Path(cl_args.output_folder)
+
     experiment_func = get_experiment_func(
         train_config_file_for_hyperopt=abspath(cl_args.train_config_file)
     )
@@ -282,18 +309,26 @@ def run_hyperopt(cl_args: Namespace) -> ExperimentAnalysis:
     search_space = _load_search_space_yaml_config(
         search_space_config_file_path=cl_args.search_space_file
     )
+
+    objective_name = get_objective_name_from_cl_argument(
+        search_objective_cla=cl_args.search_objective
+    )
+
     ax_client, ax_search_algorithm = _get_search_algorithm(
         search_space=search_space,
         output_folder=output_folder,
+        objective_name=objective_name,
         num_gpus_per_trial=cl_args.n_gpus_per_trial,
         num_cpus_per_trial=cl_args.n_cpus_per_trial,
     )
+
     atexit.register(
         partial(
             _hyperopt_run_finalizer,
             ax_client=ax_client,
             output_folder=output_folder,
             search_space=search_space,
+            objective_name=objective_name,
         )
     )
 
@@ -350,6 +385,16 @@ if __name__ == "__main__":
         default="config/base_search_space.yaml",
         help=".yaml file indicating the search space to use in the hyperparameter "
         "optimization, follows ax-platform format",
+    )
+
+    parser.add_argument(
+        "--search_objective",
+        type=str,
+        choices=["final", "best"],
+        default="final",
+        help="Whether the search algorithm uses the final performance "
+        "(i.e. last evaluation) or the peak / best performance as the reference"
+        "when choosing new parameters.",
     )
 
     parser.add_argument(
