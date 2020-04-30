@@ -20,6 +20,7 @@ from ax.plot.base import AxPlotConfig
 from ax.plot.slice import plot_slice
 from ax.plot.trace import optimization_trace_single_method
 from ax.service.ax_client import AxClient
+from human_origins_supervised import train
 from plotly import offline
 from ray import tune
 from ray.tune.analysis import ExperimentAnalysis
@@ -28,14 +29,6 @@ from ray.tune.schedulers import ASHAScheduler
 from ray.tune.suggest.ax import AxSearch
 from torch import cuda
 from yaml import load, Loader
-
-from human_origins_supervised import train
-from human_origins_supervised.data_load.datasets import merge_target_columns
-from human_origins_supervised.train_utils.metrics import (
-    get_best_average_performance,
-    get_metrics_files,
-)
-from human_origins_supervised.train_utils.utils import get_run_folder
 
 # aliases
 al_search_space = List[Dict[str, Union[TParamValue, List[TParamValue]]]]
@@ -59,7 +52,7 @@ def _convert_filepaths_to_abspaths(cl_args: Namespace) -> Namespace:
     """
     This is needed since ray is in a different context.
     """
-    keys = ["custom_lib", "snp_file", "data_folder", "label_file"]
+    keys = ["custom_lib", "snp_file", "data_source", "label_file"]
 
     for file_key in keys:
         cur_file_path = getattr(cl_args, file_key)
@@ -76,6 +69,9 @@ def _convert_filepaths_to_abspaths(cl_args: Namespace) -> Namespace:
 def get_experiment_func(train_config_file_for_hyperopt: str):
     """
     The abspath is needed since ray creates its own context.
+
+    Note that the average performance at each step is logged to ray inside the
+    evaluation handler.
     """
     train_cl_args_base = _get_default_train_cl_args(
         train_config_file_for_hyperopt=abspath(train_config_file_for_hyperopt)
@@ -87,23 +83,6 @@ def get_experiment_func(train_config_file_for_hyperopt: str):
         )
 
         train.main(cl_args=train_cl_args)
-
-        target_columns = merge_target_columns(
-            target_cat_columns=train_cl_args.target_cat_columns,
-            target_con_columns=train_cl_args.target_con_columns,
-        )
-        run_folder = get_run_folder(run_name=train_cl_args.run_name)
-        metrics_files = get_metrics_files(
-            target_columns=target_columns, run_folder=run_folder, target_prefix="v_"
-        )
-
-        best_performance = get_best_average_performance(
-            val_metrics_files=metrics_files, target_columns=target_columns
-        )
-        logger.info("Best performance: %f", best_performance)
-        tune.track.log(best_average_performance=best_performance)
-
-        return best_performance
 
     return run_experiment
 
@@ -150,7 +129,7 @@ def _get_search_algorithm(
         client.create_experiment(
             name="hyperopt_experiment",
             parameters=search_space,
-            objective_name="best_average_performance",
+            objective_name="average_performance",
             minimize=False,
             parameter_constraints=parameter_constraints,
         )
@@ -209,7 +188,7 @@ def _get_max_concurrent_runs(gpus_per_trial: int, cpus_per_trial: int):
 def _get_scheduler(grace_period: int):
     scheduler = ASHAScheduler(
         time_attr="training_iteration",
-        metric="best_average_performance",
+        metric="average_performance",
         mode="max",
         grace_period=grace_period,
     )
@@ -243,7 +222,7 @@ def _analyse_ax_results(
                 _save_slice_plot(
                     model_object=model,
                     parameter_name=param_name,
-                    metric_name="best_average_performance",
+                    metric_name="average_performance",
                     outpath=cur_outpath,
                 )
 
@@ -378,7 +357,7 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="path to .yaml file specifying experiment specific settings to be used "
-        "as CL arguments to train.py. This needs to contain at least data_folder, "
+        "as CL arguments to train.py. This needs to contain at least data_source, "
         "label_file, run_name and target column (con and/or cat) arguments as "
         "specified in train.py.",
     )

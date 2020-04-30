@@ -8,12 +8,11 @@ import numpy as np
 import pandas as pd
 import torch
 from aislib.misc_utils import ensure_path_exists
+from human_origins_supervised.data_load.data_utils import get_target_columns_generator
 from scipy.stats import pearsonr
 from sklearn.metrics import matthews_corrcoef, r2_score, mean_squared_error
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from torch.utils.tensorboard import SummaryWriter
-
-from human_origins_supervised.data_load.data_utils import get_target_columns_generator
 
 if TYPE_CHECKING:
     from human_origins_supervised.train import al_criterions
@@ -177,9 +176,9 @@ def aggregate_losses(losses_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
     return average_loss
 
 
-def get_best_average_performance(
+def get_best_overall_performance(
     val_metrics_files: Dict[str, Path], target_columns: "al_target_columns"
-):
+) -> float:
     df_performances = _get_overall_performance(
         val_metrics_files=val_metrics_files, target_columns=target_columns
     )
@@ -193,6 +192,10 @@ def _get_overall_performance(
 ) -> pd.DataFrame:
     """
     With continuous columns, we use the distance the MSE is from 1 as "performance".
+
+    For categorical columns, we use MCC.
+
+    TODO: Make categorical performance measure configurable.
     """
     target_columns_gen = get_target_columns_generator(target_columns)
 

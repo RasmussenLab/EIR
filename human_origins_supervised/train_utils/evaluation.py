@@ -2,12 +2,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, TYPE_CHECKING
 
-from ray import tune
 import numpy as np
 import pandas as pd
 import torch
 from aislib.misc_utils import get_logger
 from ignite.engine import Engine
+from ray import tune
 from scipy.special import softmax
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
@@ -73,8 +73,6 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
         loss=val_loss_avg.item(),
     )
 
-    _log_metrics_to_tune(eval_metrics_dict_w_avgs=eval_metrics_dict_w_avgs)
-
     write_eval_header = True if iteration == cl_args.sample_interval else False
     metrics.persist_metrics(
         handler_config=handler_config,
@@ -92,11 +90,13 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
         config=handler_config.config,
     )
 
+    _log_metrics_to_tune(eval_metrics_dict_w_avgs=eval_metrics_dict_w_avgs)
 
-def _log_metrics_to_tune(eval_metrics_dict_w_avgs: "al_step_metric_dict"):
-    best_average_performance = eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
+
+def _log_metrics_to_tune(eval_metrics_dict_w_avgs: "al_step_metric_dict",):
+    latest_average_performance = eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
     if hasattr(tune, "track"):
-        tune.track.log(best_average_performance=best_average_performance)
+        tune.track.log(latest_average_performance=latest_average_performance)
 
 
 def save_evaluation_results_wrapper(

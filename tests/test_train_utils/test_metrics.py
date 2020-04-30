@@ -191,7 +191,7 @@ def get_performance_average_files(tmp_path) -> Tuple[Dict[str, Path], Dict]:
 def test_get_best_average_performance(get_performance_average_files):
     test_dict, test_target_columns = get_performance_average_files
 
-    test_best_performance = metrics.get_best_average_performance(
+    test_best_performance = metrics.get_best_overall_performance(
         val_metrics_files=test_dict, target_columns=test_target_columns
     )
     assert math.isclose(0.466666, test_best_performance, rel_tol=1e-5)

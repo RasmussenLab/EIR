@@ -34,7 +34,7 @@ from human_origins_supervised.train_utils.utils import (
 from human_origins_supervised.visualization import visualization_funcs as vf
 from human_origins_supervised.train_utils.metrics import (
     get_metrics_dataframes,
-    get_best_average_performance,
+    get_best_overall_performance,
     persist_metrics,
     get_metrics_files,
     read_metrics_history_file,
@@ -428,7 +428,7 @@ def add_hparams_to_tensorboard(
     )
 
     try:
-        best_overall_performance = get_best_average_performance(
+        best_overall_performance = get_best_overall_performance(
             val_metrics_files=metrics_files, target_columns=c.target_columns
         )
         average_loss_file = metrics_files["v_average"]
