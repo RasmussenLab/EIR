@@ -1,9 +1,6 @@
-import math
 from copy import deepcopy
-from pathlib import Path
-from typing import Dict, Tuple
+from math import isclose
 
-import pandas as pd
 import pytest
 import torch
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -16,29 +13,25 @@ def test_calculate_batch_metrics():
     test_kwargs = get_calculate_batch_metrics_data_test_kwargs()
     test_batch_metrics = metrics.calculate_batch_metrics(**test_kwargs)
 
-    assert test_batch_metrics["Origin"]["v_Origin_mcc"] == 1.0
-    assert test_batch_metrics["Origin"]["v_Origin_loss"] == 0.0
+    assert test_batch_metrics["Origin"]["Origin_mcc"] == 1.0
+    assert test_batch_metrics["Origin"]["Origin_loss"] == 0.0
 
-    assert test_batch_metrics["BMI"]["v_BMI_r2"] == 1.0
-    assert test_batch_metrics["BMI"]["v_BMI_rmse"] == 0.0
-    assert test_batch_metrics["BMI"]["v_BMI_pcc"] == 1.0
-    assert test_batch_metrics["BMI"]["v_BMI_loss"] == 0.0
+    assert test_batch_metrics["BMI"]["BMI_r2"] == 1.0
+    assert test_batch_metrics["BMI"]["BMI_rmse"] == 0.0
+    # sometimes slight numerical instability with scipy pearsonr
+    assert isclose(test_batch_metrics["BMI"]["BMI_pcc"], 1.0)
+    assert test_batch_metrics["BMI"]["BMI_loss"] == 0.0
 
-    assert test_batch_metrics["Height"]["v_Height_r2"] < 0
-    assert test_batch_metrics["Height"]["v_Height_rmse"] > 0.0
-    assert test_batch_metrics["Height"]["v_Height_pcc"] == -1.0
-    assert test_batch_metrics["Height"]["v_Height_loss"] == 1.0
+    assert test_batch_metrics["Height"]["Height_r2"] < 0
+    assert test_batch_metrics["Height"]["Height_rmse"] > 0.0
+    assert isclose(test_batch_metrics["Height"]["Height_pcc"], -1.0)
+    assert test_batch_metrics["Height"]["Height_loss"] == 1.0
 
 
 def get_calculate_batch_metrics_data_test_kwargs():
     target_columns = {"cat": ["Origin"], "con": ["BMI", "Height"]}
 
     standard_scaler_fit_arr = [[0.0], [1.0], [2.0]]
-    target_transformers = {
-        "Origin": LabelEncoder().fit([1, 2, 3]),
-        "BMI": StandardScaler().fit(standard_scaler_fit_arr),
-        "Height": StandardScaler().fit(standard_scaler_fit_arr),
-    }
 
     losses = {
         "Origin": torch.tensor(0.0),
@@ -58,13 +51,20 @@ def get_calculate_batch_metrics_data_test_kwargs():
         "Height": torch.tensor([-1.0, -2.0, -3.0]).unsqueeze(1),
     }
 
+    target_transformers = {
+        "Origin": LabelEncoder().fit([1, 2, 3]),
+        "BMI": StandardScaler().fit(standard_scaler_fit_arr),
+        "Height": StandardScaler().fit(standard_scaler_fit_arr),
+    }
+    metrics = train._get_default_metrics(target_transformers=target_transformers)
+
     batch_metrics_function_kwargs = {
         "target_columns": target_columns,
-        "target_transformers": target_transformers,
         "losses": losses,
         "outputs": outputs,
         "labels": labels,
-        "prefix": "v_",
+        "mode": "val",
+        "metric_record_dict": metrics,
     }
 
     return batch_metrics_function_kwargs
@@ -142,8 +142,10 @@ def set_up_calculate_losses_data(
 
         return base_dict
 
-    test_criterions = train._get_criterions(test_target_columns_dict)
-    test_labels = generate_base_dict(label_values)
+    test_criterions = train._get_criterions(
+        target_columns=test_target_columns_dict, model_type="cnn"
+    )
+    test_labels = generate_base_dict(values=label_values)
 
     test_outputs = generate_base_dict(output_values)
 
@@ -165,51 +167,79 @@ def test_aggregate_losses():
     assert test_aggregated_losses.item() == 2.0
 
 
-@pytest.fixture
-def get_performance_average_files(tmp_path) -> Tuple[Dict[str, Path], Dict]:
-    test_list = [[0.1], [0.3], [0.2], [0.4]]
+@pytest.fixture()
+def get_l1_test_model():
+    class TestModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
 
-    files = {}
-    columns = ["v_Origin_mcc", "v_Height_loss", "v_ExtraOrigin_mcc"]
-    target_columns = {"con": ["Height"], "cat": ["Origin", "ExtraOrigin"]}
-    for i in range(3):
+            self.fc_1 = torch.nn.Linear(10, 1)
+            self.l1_penalized_weights = self.fc_1.weight
 
-        cur_column = columns[i]
+        def forward(self, x):
+            return x
 
-        df = pd.DataFrame(test_list, columns=[cur_column])
-
-        df.index.name = "iteration"
-        file_path = tmp_path / f"test_val_{i}.csv"
-        df.to_csv(file_path)
-
-        target_name = cur_column.split("_")[1]
-        files[target_name] = file_path
-
-    return files, target_columns
+    return TestModel()
 
 
-def test_get_best_average_performance(get_performance_average_files):
-    test_dict, test_target_columns = get_performance_average_files
+def test_get_extra_loss_term_functions_pass(get_l1_test_model):
 
-    test_best_performance = metrics.get_best_overall_performance(
-        val_metrics_files=test_dict, target_columns=test_target_columns
+    test_model = get_l1_test_model
+
+    extra_loss_functions_with_l1 = metrics.get_extra_loss_term_functions(
+        model=test_model, l1_weight=1.0
     )
-    assert math.isclose(0.466666, test_best_performance, rel_tol=1e-5)
+    assert len(extra_loss_functions_with_l1) == 1
 
 
-def test_get_overall_performance(get_performance_average_files):
-    """
-    Remember that the continuous loss performance is 1 - loss.
-    """
+def test_get_extra_loss_term_functions_fail(get_l1_test_model):
 
-    test_dict, test_target_columns = get_performance_average_files
+    test_model = get_l1_test_model
+    delattr(test_model, "l1_penalized_weights")
 
-    test_df_perfs = metrics._get_overall_performance(
-        val_metrics_files=test_dict, target_columns=test_target_columns
+    with pytest.raises(AttributeError):
+        metrics.get_extra_loss_term_functions(model=test_model, l1_weight=1.0)
+
+
+def test_l1_extra_loss(get_l1_test_model):
+    test_model = get_l1_test_model
+
+    torch.nn.init.ones_(test_model.fc_1.weight)
+    extra_loss_functions_with_l1 = metrics.get_extra_loss_term_functions(
+        model=test_model, l1_weight=1.0
     )
 
-    assert (test_df_perfs["Height"].values == [0.9, 0.7, 0.8, 0.6]).all()
+    l1_loss_func = extra_loss_functions_with_l1[0]
+    l1_loss = l1_loss_func()
+    assert l1_loss == 10.0
 
-    expected_cat_columns = [0.1, 0.3, 0.2, 0.4]
-    assert (test_df_perfs["Origin"].values == expected_cat_columns).all()
-    assert (test_df_perfs["ExtraOrigin"].values == expected_cat_columns).all()
+    torch.nn.init.zeros_(test_model.fc_1.weight)
+    extra_loss_functions_with_l1 = metrics.get_extra_loss_term_functions(
+        model=test_model, l1_weight=1.0
+    )
+
+    l1_loss_func = extra_loss_functions_with_l1[0]
+    l1_loss = l1_loss_func()
+    assert l1_loss == 0.0
+
+
+def test_add_extra_losses(get_l1_test_model):
+
+    test_model = get_l1_test_model
+
+    torch.nn.init.ones_(test_model.fc_1.weight)
+    extra_loss_functions_with_l1 = metrics.get_extra_loss_term_functions(
+        model=test_model, l1_weight=1.0
+    )
+    total_loss = metrics.add_extra_losses(
+        total_loss=torch.tensor(0.0), extra_loss_functions=extra_loss_functions_with_l1
+    )
+    assert total_loss == 10.0
+
+    # test that multiple losses are aggregated correctly
+    extra_loss_functions_with_l1_multiple = extra_loss_functions_with_l1 * 3
+    total_loss = metrics.add_extra_losses(
+        total_loss=torch.tensor(0.0),
+        extra_loss_functions=extra_loss_functions_with_l1_multiple,
+    )
+    assert total_loss == 30.0

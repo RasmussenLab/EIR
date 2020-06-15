@@ -20,10 +20,7 @@ from human_origins_supervised.data_load.datasets import (
 from human_origins_supervised.models import model_utils
 from human_origins_supervised.train_utils import metrics
 from human_origins_supervised.train_utils import utils
-from human_origins_supervised.train_utils.metrics import (
-    get_best_overall_performance,
-    get_metrics_files,
-)
+from human_origins_supervised.train_utils.metrics import get_metrics_files
 from human_origins_supervised.visualization import visualization_funcs as vf
 
 if TYPE_CHECKING:
@@ -67,27 +64,32 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
 
     eval_metrics_dict = metrics.calculate_batch_metrics(
         target_columns=c.target_columns,
-        target_transformers=c.target_transformers,
         losses=val_losses,
         outputs=val_outputs_total,
         labels=val_target_labels,
-        prefix="v_",
+        mode="val",
+        metric_record_dict=c.metrics,
     )
 
     eval_metrics_dict_w_avgs = metrics.add_multi_task_average_metrics(
         batch_metrics_dict=eval_metrics_dict,
         target_columns=c.target_columns,
-        prefix="v_",
         loss=val_loss_avg.item(),
+        performance_average_functions=c.metrics["averaging_functions"],
     )
 
-    write_eval_header = True if iteration == cl_args.sample_interval else False
+    do_write_eval_header = _check_if_write_eval_header(
+        iteration=iteration,
+        iterations_per_epoch=len(c.train_loader),
+        num_epochs=cl_args.n_epochs,
+        sample_interval=cl_args.sample_interval,
+    )
     metrics.persist_metrics(
         handler_config=handler_config,
         metrics_dict=eval_metrics_dict_w_avgs,
         iteration=iteration,
-        write_header=write_eval_header,
-        prefixes={"metrics": "v_", "writer": "validation"},
+        write_header=do_write_eval_header,
+        prefixes={"metrics": "validation_", "writer": "validation"},
     )
 
     save_evaluation_results_wrapper(
@@ -103,6 +105,20 @@ def validation_handler(engine: Engine, handler_config: "HandlerConfig") -> None:
     )
 
 
+def _check_if_write_eval_header(
+    iteration: int, iterations_per_epoch: int, num_epochs: int, sample_interval: int
+) -> bool:
+    total_events = iterations_per_epoch * num_epochs
+
+    if iteration == total_events and total_events < sample_interval:
+        return True
+
+    if iteration == sample_interval:
+        return True
+
+    return False
+
+
 def _log_metrics_to_tune(
     eval_metrics_dict_w_avgs: "al_step_metric_dict", cl_args: Namespace
 ):
@@ -115,13 +131,15 @@ def _log_metrics_to_tune(
     )
     run_folder = utils.get_run_folder(run_name=cl_args.run_name)
     metrics_files = get_metrics_files(
-        target_columns=target_columns, run_folder=run_folder, target_prefix="v_"
+        target_columns=target_columns,
+        run_folder=run_folder,
+        train_or_val_target_prefix="validation_",
     )
 
-    best_overall_performance = get_best_overall_performance(
-        val_metrics_files=metrics_files, target_columns=target_columns
-    )
-    latest_average_performance = eval_metrics_dict_w_avgs["v_average"]["v_perf-average"]
+    df_averages = pd.read_csv(metrics_files["average"])
+    best_overall_performance = df_averages["perf-average"].max()
+
+    latest_average_performance = eval_metrics_dict_w_avgs["average"]["perf-average"]
     if hasattr(tune, "track"):
         tune.track.log(
             best_overall_performance=best_overall_performance,
@@ -253,6 +271,7 @@ def get_most_wrong_cls_preds(
     correct_label_prob = all_wrong_probs[
         np.arange(wrong_indices.shape[0]), correct_labels_for_misclassified
     ]
+    assert correct_label_prob.max() <= 0.5
 
     wrong_pred_labels = val_preds[wrong_indices]
     wrong_label_pred_prob = all_wrong_probs[

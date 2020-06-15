@@ -1,10 +1,11 @@
 import argparse
 import sys
 from dataclasses import dataclass
+from functools import partial
 from os.path import abspath
 from pathlib import Path
 from sys import platform
-from typing import Union, Tuple, List, Dict, overload, TYPE_CHECKING
+from typing import Union, Tuple, List, Dict, overload, TYPE_CHECKING, Callable
 
 import configargparse
 import numpy as np
@@ -43,11 +44,25 @@ from human_origins_supervised.train_utils.metrics import (
     calculate_losses,
     aggregate_losses,
     add_multi_task_average_metrics,
+    get_extra_loss_term_functions,
+    add_extra_losses,
+    get_average_history_filepath,
+    calc_mcc,
+    calc_roc_auc_ovr,
+    calc_acc,
+    calc_rmse,
+    calc_pcc,
+    calc_r2,
+    calc_average_precision_ovr,
+    MetricRecord,
 )
 from human_origins_supervised.train_utils.train_handlers import configure_trainer
 
 if TYPE_CHECKING:
-    from human_origins_supervised.train_utils.metrics import al_step_metric_dict
+    from human_origins_supervised.train_utils.metrics import (
+        al_step_metric_dict,
+        al_metric_record_dict,
+    )
 
 # aliases
 al_criterions = Dict[str, Union[nn.CrossEntropyLoss, nn.MSELoss]]
@@ -57,6 +72,9 @@ al_training_labels_extra = Dict[str, Union[List[str], torch.Tensor]]
 al_training_labels_batch = Dict[
     str, Union[al_training_labels_target, al_training_labels_extra]
 ]
+al_averaging_functions_dict = Dict[
+    str, Callable[["al_step_metric_dict", str, str], float]
+]
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -65,6 +83,11 @@ logger = get_logger(name=__name__, tqdm_compatible=True)
 
 
 @dataclass
+class CustomHooks:
+    metrics: Dict
+
+
+@dataclass(frozen=True)
 class Config:
     """
     The idea of this class is to keep track of objects that need to be used
@@ -85,9 +108,14 @@ class Config:
     target_columns: al_target_columns
     data_width: int
     writer: SummaryWriter
+    metrics: "al_metric_record_dict"
+    custom_hooks: Union[CustomHooks, None]
 
 
-def main(cl_args: argparse.Namespace) -> None:
+def main(
+    cl_args: argparse.Namespace, custom_hooks: Union[CustomHooks, None] = None
+) -> None:
+
     utils.configure_root_logger(run_name=cl_args.run_name)
 
     run_folder = _prepare_run_folder(run_name=cl_args.run_name)
@@ -101,7 +129,7 @@ def main(cl_args: argparse.Namespace) -> None:
     )
 
     train_sampler = get_train_sampler(
-        column_to_sample=cl_args.weighted_sampling_column, train_dataset=train_dataset
+        columns_to_sample=cl_args.weighted_sampling_column, train_dataset=train_dataset
     )
 
     train_dloader, valid_dloader = get_dataloaders(
@@ -125,9 +153,15 @@ def main(cl_args: argparse.Namespace) -> None:
 
     optimizer = get_optimizer(model=model, cl_args=cl_args)
 
-    criterions = _get_criterions(target_columns=train_dataset.target_columns)
+    criterions = _get_criterions(
+        target_columns=train_dataset.target_columns, model_type=cl_args.model_type
+    )
 
     writer = get_summary_writer(run_folder=run_folder)
+
+    metrics = _get_default_metrics(
+        target_transformers=train_dataset.target_transformers
+    )
 
     config = Config(
         cl_args=cl_args,
@@ -142,6 +176,8 @@ def main(cl_args: argparse.Namespace) -> None:
         target_columns=train_dataset.target_columns,
         data_width=train_dataset.data_width,
         writer=writer,
+        metrics=metrics,
+        custom_hooks=custom_hooks,
     )
 
     _log_num_params(model=model)
@@ -158,7 +194,9 @@ def main(cl_args: argparse.Namespace) -> None:
 
 def _prepare_run_folder(run_name: str) -> Path:
     run_folder = utils.get_run_folder(run_name=run_name)
-    history_file = run_folder / "t_average_history.log"
+    history_file = get_average_history_filepath(
+        run_folder=run_folder, train_or_val_target_prefix="train_"
+    )
     if history_file.exists():
         raise FileExistsError(
             f"There already exists a run with that name: {history_file}. Please choose "
@@ -184,33 +222,44 @@ def _modify_bs_for_multi_gpu(multi_gpu: bool, batch_size: int) -> int:
 
 @overload
 def get_train_sampler(
-    column_to_sample: None, train_dataset: datasets.ArrayDatasetBase
+    columns_to_sample: None, train_dataset: datasets.ArrayDatasetBase
 ) -> None:
     ...
 
 
 @overload
 def get_train_sampler(
-    column_to_sample: str, train_dataset: datasets.ArrayDatasetBase
+    columns_to_sample: List[str], train_dataset: datasets.ArrayDatasetBase
 ) -> WeightedRandomSampler:
     ...
 
 
-def get_train_sampler(column_to_sample, train_dataset):
-    if column_to_sample is None:
+def get_train_sampler(columns_to_sample, train_dataset):
+    if columns_to_sample is None:
         return None
 
     loaded_target_columns = (
         train_dataset.target_columns["con"] + train_dataset.target_columns["cat"]
     )
-    if column_to_sample not in loaded_target_columns:
-        raise ValueError("Weighted sampling from non-loaded columns not supported yet.")
 
-    if column_to_sample is not None:
-        train_sampler = get_weighted_random_sampler(
-            train_dataset=train_dataset, target_column=column_to_sample
+    is_sample_column_loaded = set(columns_to_sample).issubset(
+        set(loaded_target_columns)
+    )
+    is_sample_all_cols = columns_to_sample == ["all"]
+
+    if not is_sample_column_loaded and not is_sample_all_cols:
+        raise ValueError(
+            "Weighted sampling from non-loaded columns not supported yet "
+            f"(could not find {columns_to_sample})."
         )
-        return train_sampler
+
+    if is_sample_all_cols:
+        columns_to_sample = train_dataset.target_columns["cat"]
+
+    train_sampler = get_weighted_random_sampler(
+        train_dataset=train_dataset, target_columns=columns_to_sample
+    )
+    return train_sampler
 
 
 def get_dataloaders(
@@ -248,17 +297,47 @@ def get_model(
     num_classes: al_num_classes,
     embedding_dict: Union[al_emb_lookup_dict, None],
 ) -> Union[nn.Module, nn.DataParallel]:
-    model_class = get_model_class(cl_args.model_type)
-    model = model_class(cl_args, num_classes, embedding_dict, cl_args.extra_con_columns)
+
+    model_class = get_model_class(model_type=cl_args.model_type)
+    model = model_class(
+        cl_args=cl_args,
+        num_classes=num_classes,
+        embeddings_dict=embedding_dict,
+        extra_continuous_inputs_columns=cl_args.extra_con_columns,
+    )
 
     if cl_args.model_type == "cnn":
         assert model.data_size_after_conv >= 8
 
     if cl_args.multi_gpu:
         model = nn.DataParallel(module=model)
+
+    if model_class == "linear":
+        _check_linear_model_columns(cl_args=cl_args)
+
     model = model.to(device=cl_args.device)
 
     return model
+
+
+def _check_linear_model_columns(cl_args: argparse.Namespace) -> None:
+    if (
+        len(
+            cl_args.target_cat_columns
+            + cl_args.target_con_columns
+            + cl_args.extra_cat_columns
+            + cl_args.extra_con_columns
+        )
+        != 1
+    ):
+        raise NotImplementedError(
+            "Linear model only supports one target column currently."
+        )
+
+    if len(cl_args.extra_cat_columns + cl_args.extra_con_columns) != 0:
+        raise NotImplementedError(
+            "Extra columns not supported for linear model currently."
+        )
 
 
 def get_optimizer(model: nn.Module, cl_args: argparse.Namespace) -> Optimizer:
@@ -276,10 +355,25 @@ def get_optimizer(model: nn.Module, cl_args: argparse.Namespace) -> Optimizer:
     return optimizer
 
 
-def _get_criterions(target_columns: al_target_columns) -> al_criterions:
+def _get_criterions(
+    target_columns: al_target_columns, model_type: str
+) -> al_criterions:
     criterions_dict = {}
 
+    def calc_bce(input, target):
+        # note we use input and not e.g. input_ here because torch uses name "input"
+        # in loss functions for compatibility
+        bce_loss_func = nn.BCELoss()
+        return bce_loss_func(input[:, 1], target.to(dtype=torch.float))
+
     def get_criterion(column_type_):
+
+        if model_type == "linear":
+            if column_type_ == "cat":
+                return calc_bce
+            else:
+                return nn.MSELoss()
+
         if column_type_ == "con":
             return nn.MSELoss()
         elif column_type_ == "cat":
@@ -303,6 +397,61 @@ def get_summary_writer(run_folder: Path) -> SummaryWriter:
     return writer
 
 
+def _get_default_metrics(
+    target_transformers: al_label_transformers,
+) -> "al_metric_record_dict":
+    mcc = MetricRecord(name="mcc", function=calc_mcc)
+    acc = MetricRecord(name="acc", function=calc_acc)
+    rmse = MetricRecord(
+        name="rmse",
+        function=partial(calc_rmse, target_transformers=target_transformers),
+        minimize_goal=True,
+    )
+
+    default_metrics = {
+        "cat": (mcc, acc),
+        "con": (rmse,),
+        "averaging_functions": {"con": "loss", "cat": "acc"},
+    }
+
+    # TODO: temporary metrics for testing
+    roc_auc_macro = MetricRecord(
+        name="roc-auc-macro", function=calc_roc_auc_ovr, only_val=True
+    )
+    ap_macro = MetricRecord(
+        name="ap-macro", function=calc_average_precision_ovr, only_val=True
+    )
+    r2 = MetricRecord(name="r2", function=calc_r2, only_val=True)
+    pcc = MetricRecord(name="pcc", function=calc_pcc, only_val=True)
+
+    averaging_functions = _get_default_performance_averaging_functions()
+    default_metrics = {
+        "cat": (mcc, acc, roc_auc_macro, ap_macro),
+        "con": (rmse, r2, pcc),
+        "averaging_functions": averaging_functions,
+    }
+    return default_metrics
+
+
+def _get_default_performance_averaging_functions() -> al_averaging_functions_dict:
+    def _calc_cat_averaging_value(
+        metric_dict: "al_step_metric_dict", column_name: str, metric_name: str
+    ) -> float:
+        return metric_dict[column_name][f"{column_name}_{metric_name}"]
+
+    def _calc_con_averaging_value(
+        metric_dict: "al_step_metric_dict", column_name: str, metric_name: str
+    ) -> float:
+        return 1 - metric_dict[column_name][f"{column_name}_{metric_name}"]
+
+    performance_averaging_functions = {
+        "cat": partial(_calc_cat_averaging_value, metric_name="mcc"),
+        "con": partial(_calc_con_averaging_value, metric_name="loss"),
+    }
+
+    return performance_averaging_functions
+
+
 def _log_num_params(model: nn.Module) -> None:
     no_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
@@ -314,6 +463,10 @@ def train(config: Config) -> None:
     c = config
     cl_args = config.cl_args
 
+    extra_loss_functions = get_extra_loss_term_functions(
+        model=c.model, l1_weight=cl_args.l1
+    )
+
     def step(
         engine: Engine,
         loader_batch: Tuple[torch.Tensor, al_training_labels_batch, List[str]],
@@ -324,7 +477,8 @@ def train(config: Config) -> None:
         c.model.train()
 
         train_seqs, labels, train_ids = loader_batch
-        train_seqs = train_seqs.to(device=cl_args.device, dtype=torch.float32)
+        train_seqs = train_seqs.to(device=cl_args.device)
+        train_seqs = train_seqs.to(dtype=torch.float32)
 
         target_labels = model_utils.parse_target_labels(
             target_columns=c.target_columns,
@@ -337,32 +491,36 @@ def train(config: Config) -> None:
         )
 
         c.optimizer.zero_grad()
-        train_outputs = c.model(train_seqs, extra_inputs)
+        train_outputs = c.model(x=train_seqs, extra_inputs=extra_inputs)
 
         train_losses = calculate_losses(
             criterions=c.criterions, labels=target_labels, outputs=train_outputs
         )
-        train_loss_avg = aggregate_losses(train_losses)
-        train_loss_avg.backward()
+        train_loss_avg = aggregate_losses(losses_dict=train_losses)
+        train_loss_final = add_extra_losses(
+            total_loss=train_loss_avg, extra_loss_functions=extra_loss_functions
+        )
+
+        train_loss_final.backward()
         c.optimizer.step()
 
-        batch_metrics_dict = calculate_batch_metrics(
+        train_batch_metrics = calculate_batch_metrics(
             target_columns=c.target_columns,
-            target_transformers=c.target_transformers,
             losses=train_losses,
             outputs=train_outputs,
             labels=target_labels,
-            prefix="t_",
+            mode="train",
+            metric_record_dict=c.metrics,
         )
 
-        batch_metrics_dict_w_avgs = add_multi_task_average_metrics(
-            batch_metrics_dict=batch_metrics_dict,
+        train_batch_metrics_with_averages = add_multi_task_average_metrics(
+            batch_metrics_dict=train_batch_metrics,
             target_columns=c.target_columns,
-            prefix="t_",
             loss=train_loss_avg.item(),
+            performance_average_functions=c.metrics["averaging_functions"],
         )
 
-        return batch_metrics_dict_w_avgs
+        return train_batch_metrics_with_averages
 
     trainer = Engine(process_function=step)
 
@@ -405,16 +563,13 @@ def get_train_argument_parser() -> configargparse.ArgumentParser:
         "--lr_schedule",
         type=str,
         default="same",
-        choices=["cycle", "plateau", "same"],
+        choices=["cycle", "plateau", "same", "cosine"],
         help="Whether to use cyclical or reduce on plateau learning rate schedule. "
         "Otherwise keeps same learning rate.",
     )
 
     parser_.add_argument(
-        "--warmup_steps",
-        type=str,
-        default="auto",
-        help="How many steps to use in warmup.",
+        "--warmup_steps", type=str, default=0, help="How many steps to use in warmup."
     )
 
     parser_.add_argument(
@@ -448,6 +603,10 @@ def get_train_argument_parser() -> configargparse.ArgumentParser:
     parser_.add_argument("--wd", type=float, default=0.00, help="Weight decay.")
 
     parser_.add_argument(
+        "--l1", type=float, default=0.00, help="L1 regularization for chosen layer."
+    )
+
+    parser_.add_argument(
         "--fc_repr_dim",
         type=int,
         default=512,
@@ -469,7 +628,7 @@ def get_train_argument_parser() -> configargparse.ArgumentParser:
         "--model_type",
         type=str,
         default="cnn",
-        choices=["cnn", "mlp"],
+        choices=["cnn", "mlp", "linear"],
         help="whether to use a convolutional neural network (cnn) or multilayer "
         "perceptron (mlp)",
     )
@@ -574,6 +733,7 @@ def get_train_argument_parser() -> configargparse.ArgumentParser:
         "--weighted_sampling_column",
         type=str,
         default=None,
+        nargs="*",
         help="Target column to apply weighted sampling on.",
     )
 

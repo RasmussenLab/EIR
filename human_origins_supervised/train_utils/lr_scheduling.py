@@ -1,4 +1,5 @@
 from argparse import Namespace
+from math import isclose
 from pathlib import Path
 from typing import Tuple, Union, Dict, TYPE_CHECKING, overload
 
@@ -15,7 +16,10 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.optimizer import Optimizer
 
 from human_origins_supervised.train_utils.utils import get_run_folder
-from human_origins_supervised.train_utils.metrics import read_metrics_history_file
+from human_origins_supervised.train_utils.metrics import (
+    read_metrics_history_file,
+    get_average_history_filepath,
+)
 
 if TYPE_CHECKING:
     from human_origins_supervised.train_utils.train_handlers import HandlerConfig
@@ -38,7 +42,7 @@ def attach_lr_scheduler(
     """
     cl_args = config.cl_args
 
-    if cl_args.lr_schedule == "cycle":
+    if cl_args.lr_schedule in ["cycle", "cosine"]:
         engine.add_event_handler(
             event_name=Events.ITERATION_STARTED, handler=lr_scheduler
         )
@@ -46,7 +50,7 @@ def attach_lr_scheduler(
     elif cl_args.lr_schedule == "plateau":
 
         step_scheduler_params = _get_reduce_lr_on_plateu_step_params(
-            cl_args=cl_args, config=config
+            cl_args=cl_args, optimizer=config.optimizer
         )
         engine.add_event_handler(
             event_name=Events.ITERATION_COMPLETED,
@@ -54,23 +58,33 @@ def attach_lr_scheduler(
             reduce_on_plateau_scheduler=lr_scheduler,
             **step_scheduler_params
         )
+    else:
+        raise ValueError()
 
 
 def get_eval_history_path(run_name: str):
-    eval_history_fpath = get_run_folder(run_name=run_name) / "v_average_history.log"
+    eval_history_fpath = (
+        get_run_folder(run_name=run_name) / "validation_average_history.log"
+    )
     return eval_history_fpath
 
 
-def _get_reduce_lr_on_plateu_step_params(cl_args: Namespace, config: "Config") -> Dict:
-    eval_history_fpath = get_eval_history_path(run_name=cl_args.run_name)
+def _get_reduce_lr_on_plateu_step_params(
+    cl_args: Namespace, optimizer: Optimizer
+) -> Dict:
+
+    run_folder = get_run_folder(run_name=cl_args.run_name)
+    validation_history_fpath = get_average_history_filepath(
+        run_folder=run_folder, train_or_val_target_prefix="validation_"
+    )
 
     warmup_steps = _get_warmup_steps_from_cla(
-        warmup_steps_arg=cl_args.warmup_steps, optimizer=config.optimizer
+        warmup_steps_arg=cl_args.warmup_steps, optimizer=optimizer
     )
 
     params = {
-        "eval_history_fpath": eval_history_fpath,
-        "optimizer": config.optimizer,
+        "validation_history_fpath": validation_history_fpath,
+        "optimizer": optimizer,
         "sample_interval": cl_args.sample_interval,
         "lr_upper_bound": cl_args.lr,
         "lr_lower_bound": cl_args.lr_lb,
@@ -80,7 +94,7 @@ def _get_reduce_lr_on_plateu_step_params(cl_args: Namespace, config: "Config") -
     return params
 
 
-def set_up_scheduler(
+def set_up_lr_scheduler(
     handler_config: "HandlerConfig",
 ) -> Union[ConcatScheduler, CosineAnnealingScheduler, ReduceLROnPlateau]:
 
@@ -90,20 +104,38 @@ def set_up_scheduler(
     lr_lower_bound = c.cl_args.lr_lb
     lr_upper_bound = c.cl_args.lr
 
-    if cl_args.lr_schedule == "cycle":
+    def _get_cycle_iter_size(warmup_steps_: int) -> int:
+        """
+        Why this weird max(2, ...)? This is because the `ignite`
+        `CosineAnnealingScheduler` expects at least 2 steps, so if we have fewer steps
+        than the warmup period, we have max(2, negative number) = 2 for
+        compatibility.
+        """
+        steps = len(c.train_loader)
+        if cl_args.lr_schedule == "cosine":
+            steps = max(2, steps * c.cl_args.n_epochs - warmup_steps_)
 
-        lr_scheduler, lr_scheduler_args = _get_cyclic_lr_scheduler(
-            optimizer=c.optimizer,
-            lr_upper_bound=lr_upper_bound,
-            lr_lower_bound=lr_lower_bound,
-            cycle_iter_size=len(c.train_loader),
-        )
+        return steps
 
+    def _get_total_num_events(n_epochs: int, iter_per_epoch: int) -> int:
+        return n_epochs * iter_per_epoch
+
+    if cl_args.lr_schedule in ["cycle", "cosine"]:
         warmup_steps = _get_warmup_steps_from_cla(
             warmup_steps_arg=cl_args.warmup_steps, optimizer=c.optimizer
         )
 
-        if warmup_steps is not None:
+        cycle_iter_size = _get_cycle_iter_size(warmup_steps_=warmup_steps)
+
+        lr_scheduler, lr_scheduler_args = _get_cosine_lr_scheduler(
+            optimizer=c.optimizer,
+            lr_upper_bound=lr_upper_bound,
+            lr_lower_bound=lr_lower_bound,
+            cycle_iter_size=cycle_iter_size,
+            schedule=cl_args.lr_schedule,
+        )
+
+        if warmup_steps:
             lr_scheduler, lr_scheduler_args = _attach_warmup_to_scheduler(
                 lr_scheduler=lr_scheduler,
                 lr_lower_bound=lr_lower_bound,
@@ -111,10 +143,12 @@ def set_up_scheduler(
                 duration=warmup_steps,
             )
 
+        num_events = _get_total_num_events(
+            n_epochs=cl_args.n_epochs, iter_per_epoch=len(c.train_loader)
+        )
         _plot_lr_schedule(
             lr_scheduler=lr_scheduler,
-            n_epochs=cl_args.n_epochs,
-            cycle_iter_size=len(c.train_loader),
+            num_events=num_events,
             output_folder=handler_config.run_folder,
             lr_scheduler_args=lr_scheduler_args,
         )
@@ -125,7 +159,10 @@ def set_up_scheduler(
         )
         logger.info("Plateau patience set to %d.", patience_steps)
         lr_scheduler = ReduceLROnPlateau(
-            c.optimizer, "min", patience=patience_steps, min_lr=lr_lower_bound
+            optimizer=c.optimizer,
+            mode="min",
+            patience=patience_steps,
+            min_lr=lr_lower_bound,
         )
 
     else:
@@ -134,18 +171,15 @@ def set_up_scheduler(
     return lr_scheduler
 
 
-def _get_cyclic_lr_scheduler(
+def _get_cosine_lr_scheduler(
     optimizer: Optimizer,
     lr_upper_bound: float,
     lr_lower_bound: float,
     cycle_iter_size: int,
+    schedule: str,
 ) -> Tuple[CosineAnnealingScheduler, Dict]:
 
     """
-    Note that the full cycle of the linear lr_scheduler increases and decreases, hence
-    we use durations as cycle_iter_size // 2 to make the first lr_scheduler only go for
-    the increasing phase.
-
     We return the arguments because the simulate_values are classmethods, which
     we need to pass the arguments too.
     """
@@ -156,9 +190,12 @@ def _get_cyclic_lr_scheduler(
         "start_value": lr_upper_bound,
         "end_value": lr_lower_bound,
         "cycle_size": cycle_iter_size,
-        "cycle_mult": 2,
-        "start_value_mult": 1,
     }
+
+    if schedule == "cycle":
+        cosine_scheduler_kwargs["cycle_mult"] = 2
+        cosine_scheduler_kwargs["start_value_mult"] = 1
+
     lr_scheduler = CosineAnnealingScheduler(**cosine_scheduler_kwargs)
 
     return lr_scheduler, cosine_scheduler_kwargs
@@ -176,7 +213,7 @@ def _get_warmup_steps_from_cla(warmup_steps_arg: str, optimizer: Optimizer) -> i
 
 def _get_warmup_steps_from_cla(warmup_steps_arg, optimizer):
     if warmup_steps_arg is None:
-        return warmup_steps_arg
+        return 0
     elif warmup_steps_arg == "auto":
         auto_steps = _calculate_auto_warmup_steps(optimizer=optimizer)
         logger.info(
@@ -201,19 +238,20 @@ def _calculate_auto_warmup_steps(optimizer: Optimizer) -> int:
 
 def _plot_lr_schedule(
     lr_scheduler: Union[ConcatScheduler, CosineAnnealingScheduler],
-    n_epochs: int,
-    cycle_iter_size: int,
+    num_events: int,
     lr_scheduler_args: Dict,
     output_folder: Path,
 ):
 
     simulated_vals = np.array(
-        lr_scheduler.simulate_values(
-            num_events=n_epochs * cycle_iter_size, **lr_scheduler_args
-        )
+        lr_scheduler.simulate_values(num_events=num_events, **lr_scheduler_args)
     )
 
     plt.plot(simulated_vals[:, 0], simulated_vals[:, 1])
+    plt.title("Learning Rate Schedule")
+    plt.xlabel("Iteration")
+    plt.ylabel("Learning Rate")
+
     plt.savefig(output_folder / "lr_schedule.png")
     plt.close("all")
 
@@ -232,22 +270,45 @@ def _calc_plateu_patience(steps_per_epoch: int, sample_interval: int):
 
 
 def _attach_warmup_to_scheduler(
-    lr_scheduler: Union[CosineAnnealingScheduler, ReduceLROnPlateau],
+    lr_scheduler: CosineAnnealingScheduler,
     lr_lower_bound: float,
     lr_upper_bound: float,
     duration: int,
 ) -> Tuple[ConcatScheduler, Dict]:
+    """
+    We have `patched_duration_for_cosine_end` because attaching a warmup to a cosine
+    scheduler seems to 'offset' it's length by one step. This means that if we have
+    100 warmup steps, and 125 cosine steps, iteration 225 will be in the next cycle
+    of a cosine annealing schedule, meaning the LR upper bound.
 
+    This can be seen by monitoring the iteration and current optimizer LR, which shows
+    e.g. (LR=0.01 iteration=225) when printing the values.
+
+    This happens because internally, the `create_lr_scheduler_with_warmup` `ignite`
+    function reduces the duration of the warmup by one step. That is if we pass in 100
+    warmup steps, steps 1-98 will be in the warmup phase (99 steps in total). This
+    happens because of the following line in `ignite` 0.3:
+
+    milestones_values[-1] = (warmup_duration - 2, warmup_end_value - d)
+
+    So since the warmup steps are 1 less, it means that the cosine annealing will be
+    one step more, meaning that the last step is a new cycle.
+
+    This can be tested quite easily with the `output_simulated_values` argument,
+    which shows the jump in LR in the last cycle if we pass in `durations` unpatched.
+    """
+
+    patched_duration_for_cosine_end = duration + 1
     scheduler_w_warmup = create_lr_scheduler_with_warmup(
         lr_scheduler=lr_scheduler,
         warmup_start_value=lr_lower_bound,
         warmup_end_value=lr_upper_bound,
-        warmup_duration=duration,
+        warmup_duration=patched_duration_for_cosine_end,
     )
 
     concat_scheduler_args = {
         "schedulers": scheduler_w_warmup.schedulers,
-        "durations": [duration],
+        "durations": [patched_duration_for_cosine_end],
     }
 
     return scheduler_w_warmup, concat_scheduler_args
@@ -260,16 +321,20 @@ def _step_reduce_on_plateau_scheduler(
     lr_lower_bound: float,
     sample_interval: int,
     reduce_on_plateau_scheduler: ReduceLROnPlateau,
-    eval_history_fpath: Path,
+    validation_history_fpath: Path,
     warmup_steps: Union[None, int],
 ) -> None:
     """
     We do the warmup manually here because currently ignite does not support warmup
     with ReduceLROnPlateau through create_lr_scheduler_with_warmup because
     ReduceLROnPlateau does not inherit from _LRScheduler.
+
+    TODO:   Possibly use average performance here as measure of whether to step (instead
+            of loss)?
     """
     iteration = engine.state.iteration
 
+    # manual warmup
     if warmup_steps is not None and iteration <= warmup_steps:
         step_size = (lr_upper_bound - lr_lower_bound) / warmup_steps
         cur_lr = lr_lower_bound + step_size * iteration
@@ -277,12 +342,20 @@ def _step_reduce_on_plateau_scheduler(
             param_group["lr"] = cur_lr
 
     else:
-        if iteration % sample_interval == 0:
+        cur_lr = get_optimizer_lr(optimizer=optimizer)
+
+        if iteration % sample_interval == 0 and not isclose(cur_lr, lr_lower_bound):
             _log_reduce_on_plateu_step(reduce_on_plateau_scheduler, iteration)
 
-            eval_df = read_metrics_history_file(eval_history_fpath)
-            latest_val_loss = eval_df["v_loss-average"].iloc[-1]
+            validation_df = read_metrics_history_file(
+                file_path=validation_history_fpath
+            )
+            latest_val_loss = validation_df["loss-average"].iloc[-1]
             reduce_on_plateau_scheduler.step(latest_val_loss)
+
+
+def get_optimizer_lr(optimizer: Optimizer):
+    return optimizer.param_groups[0]["lr"]
 
 
 def _log_reduce_on_plateu_step(
@@ -290,7 +363,7 @@ def _log_reduce_on_plateu_step(
 ) -> None:
     sched = reduce_on_plateau_scheduler
 
-    prev_lr = sched.optimizer.param_groups[0]["lr"]
+    prev_lr = get_optimizer_lr(optimizer=sched.optimizer)
     new_lr = prev_lr * sched.factor
     if sched.num_bad_epochs >= sched.patience and prev_lr > sched.min_lrs[0]:
         logger.info(

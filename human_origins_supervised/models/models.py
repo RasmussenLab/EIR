@@ -1,6 +1,6 @@
 from argparse import Namespace
 from collections import OrderedDict
-from typing import List, Union, Tuple, Dict
+from typing import List, Union, Tuple, Dict, Callable
 
 import torch
 from aislib import pytorch_utils
@@ -11,10 +11,11 @@ from torch import nn
 from human_origins_supervised.data_load.datasets import al_num_classes
 from . import extra_inputs_module
 from .extra_inputs_module import al_emb_lookup_dict
+from .layers import SelfAttention, FirstBlock, Block
 from .model_utils import find_no_resblocks_needed
 
 # type aliases
-al_models = Union["CNNModel", "MLPModel"]
+al_models = Union["CNNModel", "MLPModel", "LinearModel"]
 
 logger = get_logger(name=__name__, tqdm_compatible=True)
 
@@ -22,227 +23,10 @@ logger = get_logger(name=__name__, tqdm_compatible=True)
 def get_model_class(model_type: str) -> al_models:
     if model_type == "cnn":
         return CNNModel
-    return MLPModel
+    elif model_type == "mlp":
+        return MLPModel
 
-
-class SelfAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SelfAttention, self).__init__()
-        self.in_channels = in_channels
-        self.reduction = max(self.in_channels // 8, 1)
-
-        self.conv_theta = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=self.reduction,
-            kernel_size=1,
-            bias=False,
-        )
-        self.conv_phi = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=self.reduction,
-            kernel_size=1,
-            bias=False,
-        )
-        self.conv_g = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=in_channels // 2,
-            kernel_size=1,
-            bias=False,
-        )
-        self.conv_o = nn.Conv2d(
-            in_channels=in_channels // 2,
-            out_channels=in_channels,
-            kernel_size=1,
-            bias=False,
-        )
-        self.pool = nn.AvgPool2d((1, 4), stride=(1, 4), padding=0)
-        self.softmax = nn.Softmax(dim=-1)
-        self.gamma = nn.Parameter(torch.zeros(1), True)
-
-    def forward(self, x):
-        _, ch, h, w = x.size()
-
-        # Theta path
-        theta = self.conv_theta(x)
-        theta = theta.view(-1, self.reduction, h * w)
-
-        # Phi path
-        phi = self.conv_phi(x)
-        phi = self.pool(phi)
-        phi = phi.view(-1, self.reduction, h * w // 4)
-
-        # Attn map
-        attn = torch.bmm(theta.permute(0, 2, 1), phi)
-        attn = self.softmax(attn)
-
-        # g path
-        g = self.conv_g(x)
-        g = self.pool(g)
-        g = g.view(-1, ch // 2, h * w // 4)
-
-        # Attn_g - o_conv
-        attn_g = torch.bmm(g, attn.permute(0, 2, 1))
-        attn_g = attn_g.view(-1, ch // 2, h, w)
-        attn_g = self.conv_o(attn_g)
-
-        # Out
-        out = x + self.gamma * attn_g
-        return out
-
-
-class SEBlock(nn.Module):
-    def __init__(self, channels: int, reduction: int):
-        super(SEBlock, self).__init__()
-        reduced_channels = max(1, channels // reduction)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-
-        self.conv_down = nn.Conv2d(
-            in_channels=channels,
-            out_channels=reduced_channels,
-            kernel_size=1,
-            padding=0,
-            bias=False,
-        )
-        self.act_1 = Swish()
-
-        self.conv_up = nn.Conv2d(
-            in_channels=reduced_channels,
-            out_channels=channels,
-            kernel_size=1,
-            padding=0,
-            bias=False,
-        )
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        out = self.avg_pool(x)
-
-        out = self.conv_down(out)
-        out = self.act_1(out)
-
-        out = self.conv_up(out)
-        out = self.sigmoid(out)
-
-        return out
-
-
-class AbstractBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        rb_do: float,
-        dilation: int,
-        conv_1_kernel_w: int = 12,
-        conv_1_padding: int = 4,
-        down_stride_w: int = 4,
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.conv_1_kernel_w = conv_1_kernel_w
-        self.conv_1_padding = conv_1_padding
-        self.down_stride_w = down_stride_w
-
-        self.conv_1_kernel_h = 4 if isinstance(self, FirstBlock) else 1
-        self.down_stride_h = self.conv_1_kernel_h
-
-        self.rb_do = nn.Dropout2d(rb_do)
-        self.act_1 = Swish()
-
-        self.bn_1 = nn.BatchNorm2d(in_channels)
-        self.conv_1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=(self.conv_1_kernel_h, conv_1_kernel_w),
-            stride=(self.down_stride_h, down_stride_w),
-            padding=(0, conv_1_padding),
-            bias=False,
-        )
-
-        conv_2_kernel_w = (
-            conv_1_kernel_w - 1 if conv_1_kernel_w % 2 == 0 else conv_1_kernel_w
-        )
-        conv_2_padding = conv_2_kernel_w // 2
-
-        self.act_2 = Swish()
-        self.bn_2 = nn.BatchNorm2d(out_channels)
-        self.conv_2 = nn.Conv2d(
-            out_channels,
-            out_channels,
-            kernel_size=(1, conv_2_kernel_w),
-            stride=(1, 1),
-            padding=(0, conv_2_padding * dilation),
-            dilation=(1, dilation),
-            bias=False,
-        )
-
-        self.downsample_identity = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=(self.conv_1_kernel_h, conv_1_kernel_w),
-                stride=(self.down_stride_h, down_stride_w),
-                padding=(0, conv_1_padding),
-                bias=False,
-            )
-        )
-
-        self.se_block = SEBlock(channels=out_channels, reduction=16)
-
-    def forward(self, x: torch.Tensor):
-        raise NotImplementedError
-
-
-class FirstBlock(AbstractBlock):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        delattr(self, "bn_1")
-        delattr(self, "act_1")
-        delattr(self, "downsample_identity")
-        delattr(self, "bn_2")
-        delattr(self, "act_2")
-        delattr(self, "rb_do")
-        delattr(self, "conv_2")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv_1(x)
-
-        return out
-
-
-class Block(AbstractBlock):
-    def __init__(self, full_preact: bool = False, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self.full_preact = full_preact
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.bn_1(x)
-        out = self.act_1(out)
-
-        if self.full_preact:
-            identity = self.downsample_identity(out)
-        else:
-            identity = self.downsample_identity(x)
-
-        out = self.conv_1(out)
-
-        out = self.bn_2(out)
-        out = self.act_2(out)
-
-        out = self.rb_do(out)
-        out = self.conv_2(out)
-
-        channel_recalibrations = self.se_block(out)
-        out = out * channel_recalibrations
-
-        out = out + identity
-
-        return out
+    return LinearModel
 
 
 def _get_block(
@@ -394,11 +178,13 @@ class ModelBase(nn.Module):
         # TODO: Better to have this a method so fc_extra is explicitly defined?
         if emb_total_dim or con_total_dim:
             extra_dim = emb_total_dim + con_total_dim
+            # we have a specific layer for fc_extra in case it's going straight
+            # to bn or act, ensuring linear before
             self.fc_extra = nn.Linear(extra_dim, extra_dim, bias=False)
             self.fc_repr_and_extra_dim += extra_dim
 
     @property
-    def fc_1_in_features(self):
+    def fc_1_in_features(self) -> int:
         raise NotImplementedError
 
 
@@ -454,7 +240,26 @@ def _get_multi_task_branches(
         module_dict[key] = task_layer_branch
 
     _assert_uniqueness()
+    _assert_module_dict_uniqueness(module_dict)
     return nn.ModuleDict(module_dict)
+
+
+def _assert_module_dict_uniqueness(module_dict: Dict[str, nn.Sequential]):
+    """
+    We have this function as a safeguard to help us catch if we are reusing modules
+    when they should not be (i.e. if splitting into multiple branches with same layers,
+    one could accidentally reuse the instantiated nn.Modules across branches).
+    """
+    branch_ids = [id(sequential_branch) for sequential_branch in module_dict.values()]
+    assert len(branch_ids) == len(set(branch_ids))
+
+    module_ids = []
+    for sequential_branch in module_dict.values():
+        module_ids += [id(module) for module in sequential_branch]
+
+    num_total_modules = len(module_ids)
+    num_unique_modules = len(set(module_ids))
+    assert num_unique_modules == num_total_modules
 
 
 class CNNModel(ModelBase):
@@ -487,6 +292,17 @@ class CNNModel(ModelBase):
             fc_do=self.cl_args.fc_do,
         )
 
+        self._init_weights()
+
+    @property
+    def fc_1_in_features(self) -> int:
+        return self.no_out_channels * self.data_size_after_conv
+
+    @property
+    def l1_penalized_weights(self) -> torch.Tensor:
+        return self.conv[0].conv_1.weight
+
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 # Swish slope is roughly 0.5 around 0
@@ -496,27 +312,7 @@ class CNNModel(ModelBase):
                 nn.init.constant_(m.bias, 0)
 
     @property
-    def fc_1_in_features(self):
-        return self.no_out_channels * self.data_size_after_conv
-
-    def forward(self, x: torch.Tensor, extra_inputs: torch.Tensor = None):
-        out = self.conv(x)
-        out = out.view(out.shape[0], -1)
-
-        out = self.fc_1(out)
-
-        if extra_inputs is not None:
-            out_extra = self.fc_extra(extra_inputs)
-            out = torch.cat((out_extra, out), dim=1)
-
-        out = _calculate_task_branch_outputs(
-            input_=out, last_module=self.multi_task_branches
-        )
-
-        return out
-
-    @property
-    def resblocks(self):
+    def resblocks(self) -> List[int]:
         if not self.cl_args.resblocks:
             residual_blocks = find_no_resblocks_needed(
                 self.cl_args.target_width,
@@ -531,19 +327,45 @@ class CNNModel(ModelBase):
             return residual_blocks
         return self.cl_args.resblocks
 
+    def forward(
+        self, x: torch.Tensor, extra_inputs: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
+        out = self.conv(x)
+        out = out.view(out.shape[0], -1)
+
+        out = self.fc_1(out)
+
+        if extra_inputs is not None:
+            out_extra = self.fc_extra(extra_inputs)
+            out = torch.cat((out_extra, out), dim=1)
+
+        out = _calculate_module_dict_outputs(
+            input_=out, module_dict=self.multi_task_branches
+        )
+
+        return out
+
 
 class MLPModel(ModelBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        self.fc_0 = nn.Linear(
+            self.fc_1_in_features, self.cl_args.fc_repr_dim, bias=False
+        )
+
+        self.downsample_fc_0_identities = _get_mlp_downsample_identities_moduledict(
+            num_classes=self.num_classes, in_features=self.fc_repr_and_extra_dim
+        )
+
         self.fc_1 = nn.Sequential(
             OrderedDict(
                 {
-                    "fc_1_linear_1": nn.Linear(
-                        self.fc_1_in_features, self.cl_args.fc_repr_dim, bias=False
-                    ),
-                    "fc_1_act_1": Swish(),
                     "fc_1_bn_1": nn.BatchNorm1d(self.cl_args.fc_repr_dim),
+                    "fc_1_act_1": Swish(),
+                    "fc_1_linear_1": nn.Linear(
+                        self.cl_args.fc_repr_dim, self.cl_args.fc_repr_dim, bias=False
+                    ),
                 }
             )
         )
@@ -555,12 +377,34 @@ class MLPModel(ModelBase):
             fc_do=self.cl_args.fc_do,
         )
 
+        self._init_weights()
+
     @property
-    def fc_1_in_features(self):
+    def fc_1_in_features(self) -> int:
         return self.cl_args.target_width * 4
 
-    def forward(self, x: torch.Tensor, extra_inputs: torch.Tensor = None):
+    @property
+    def l1_penalized_weights(self) -> torch.Tensor:
+        return self.fc_0.weight
+
+    def _init_weights(self):
+        for task_branch in self.multi_task_branches.values():
+            nn.init.zeros_(task_branch.fc_3_bn_1.weight)
+
+    def forward(
+        self, x: torch.Tensor, extra_inputs: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
         out = x.view(x.shape[0], -1)
+
+        out = self.fc_0(out)
+
+        identity_inputs = out
+        if extra_inputs is not None:
+            identity_inputs = torch.cat((extra_inputs, identity_inputs), dim=1)
+
+        identities = _calculate_module_dict_outputs(
+            input_=identity_inputs, module_dict=self.downsample_fc_0_identities
+        )
 
         out = self.fc_1(out)
 
@@ -568,18 +412,102 @@ class MLPModel(ModelBase):
             out_extra = self.fc_extra(extra_inputs)
             out = torch.cat((out_extra, out), dim=1)
 
-        out = _calculate_task_branch_outputs(
-            input_=out, last_module=self.multi_task_branches
+        out = _calculate_module_dict_outputs(
+            input_=out, module_dict=self.multi_task_branches
         )
+
+        out = {
+            column_name: feature + identities[column_name]
+            for column_name, feature in out.items()
+        }
 
         return out
 
 
-def _calculate_task_branch_outputs(
-    input_: torch.Tensor, last_module: nn.ModuleDict
+def _get_mlp_downsample_identities_moduledict(
+    num_classes: Dict[str, int], in_features: int
+) -> nn.ModuleDict:
+    """
+    Currently redundant cast to `nn.Sequential` here for compatibility with
+    `assert_module_dict_uniqueness`.
+    """
+    module_dict = {}
+    for key, cur_num_output_classes in num_classes.items():
+        module_dict[key] = nn.Sequential(
+            nn.Linear(
+                in_features=in_features, out_features=cur_num_output_classes, bias=True
+            )
+        )
+
+    _assert_module_dict_uniqueness(module_dict)
+    return nn.ModuleDict(module_dict)
+
+
+def _calculate_module_dict_outputs(
+    input_: torch.Tensor, module_dict: nn.ModuleDict
 ) -> Dict[str, torch.Tensor]:
     final_out = {}
-    for target_column, linear_layer in last_module.items():
+    for target_column, linear_layer in module_dict.items():
         final_out[target_column] = linear_layer(input_)
 
     return final_out
+
+
+class LinearModel(nn.Module):
+    def __init__(self, cl_args: Namespace, *args, **kwargs):
+        super().__init__()
+
+        self.cl_args = cl_args
+        self.fc_1_in_features = self.cl_args.target_width * 4
+
+        self.fc_1 = nn.Linear(self.fc_1_in_features, 1)
+        self.act = self._get_act()
+
+        self.output_parser = self._get_output_parser()
+
+    @property
+    def l1_penalized_weights(self) -> torch.Tensor:
+        return self.fc_1.weight
+
+    def _get_act(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        if self.cl_args.target_cat_columns:
+            logger.info(
+                "Using logistic regression model on categorical column: %s.",
+                self.cl_args.target_cat_columns,
+            )
+            return nn.Sigmoid()
+
+        # no activation for linear regression
+        elif self.cl_args.target_con_columns:
+            logger.info(
+                "Using linear regression model on continuous column: %s.",
+                self.cl_args.target_con_columns,
+            )
+            return lambda x: x
+
+        raise ValueError()
+
+    def _get_output_parser(self) -> Callable[[torch.Tensor], Dict[str, torch.Tensor]]:
+        def _parse_categorical(out: torch.Tensor) -> Dict[str, torch.Tensor]:
+            # we create a 2D output from 1D for compatibility with visualization funcs
+            out = torch.cat(((1 - out[:, 0]).unsqueeze(1), out), 1)
+            out = {self.cl_args.target_cat_columns[0]: out}
+            return out
+
+        def _parse_continuous(out: torch.Tensor) -> Dict[str, torch.Tensor]:
+            out = {self.cl_args.target_con_columns[0]: out}
+            return out
+
+        if self.cl_args.target_cat_columns:
+            return _parse_categorical
+        return _parse_continuous
+
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        out = x.view(x.shape[0], -1)
+
+        out = self.fc_1(out)
+        out = self.act(out)
+
+        out = self.output_parser(out)
+
+        return out
