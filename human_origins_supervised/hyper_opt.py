@@ -1,6 +1,6 @@
-import json
 import argparse
 import atexit
+import json
 import uuid
 from argparse import Namespace
 from functools import partial
@@ -21,15 +21,17 @@ from ax.plot.base import AxPlotConfig
 from ax.plot.slice import plot_slice
 from ax.plot.trace import optimization_trace_single_method
 from ax.service.ax_client import AxClient
-from human_origins_supervised import train
 from plotly import offline
 from ray import tune
 from ray.tune.analysis import ExperimentAnalysis
 from ray.tune.logger import DEFAULT_LOGGERS, TBXLogger
 from ray.tune.schedulers import ASHAScheduler
+from ray.tune.suggest import ConcurrencyLimiter
 from ray.tune.suggest.ax import AxSearch
 from torch import cuda
 from yaml import load, Loader
+
+from human_origins_supervised import train
 
 # aliases
 al_search_space = List[Dict[str, Union[TParamValue, List[TParamValue]]]]
@@ -139,7 +141,10 @@ def _get_search_algorithm(
     max_concurrent = _get_max_concurrent_runs(
         gpus_per_trial=num_gpus_per_trial, cpus_per_trial=num_cpus_per_trial
     )
-    search_algorithm = AxSearch(client, max_concurrent=max_concurrent)
+    search_algorithm = AxSearch(client)
+    search_algorithm = ConcurrencyLimiter(
+        search_algorithm, max_concurrent=max_concurrent
+    )
 
     return client, search_algorithm
 
