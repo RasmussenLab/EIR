@@ -1,17 +1,20 @@
+import argparse
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from typing import Iterable
 
 import pandas as pd
 import pytest
 import torch
 from sklearn.preprocessing import LabelEncoder
 
-from conftest import cleanup
-from human_origins_supervised import predict
-from human_origins_supervised import train
-from human_origins_supervised.models.models import CNNModel
-from test_data_load.test_datasets import check_dataset
+from eir import predict
+from eir import train
+from eir.data_load.label_setup import TabularFileInfo
+from eir.models.omics.models_cnn import CNNModel
+from eir.models.omics.omics_models import get_omics_model_init_kwargs
+from tests.conftest import cleanup
+from tests.test_data_load.test_datasets import check_dataset
 
 
 def test_load_model(args_config, tmp_path):
@@ -22,21 +25,21 @@ def test_load_model(args_config, tmp_path):
     """
 
     cl_args = args_config
-    num_classes = {"Origin": 3}
-    model: torch.nn.Module = CNNModel(
-        cl_args=cl_args,
-        num_classes=num_classes,
-        embeddings_dict=None,
-        extra_continuous_inputs_columns=cl_args.extra_con_columns,
-    ).to(device=cl_args.device)
+
+    data_dimension = train.DataDimensions(channels=1, height=4, width=1000)
+    cnn_init_kwargs = get_omics_model_init_kwargs(
+        model_type="cnn", cl_args=cl_args, data_dimensions=data_dimension
+    )
+    model = CNNModel(**cnn_init_kwargs)
+    model = model.to(device=cl_args.device)
 
     model_path = tmp_path / "model.pt"
     torch.save(obj=model.state_dict(), f=model_path)
 
     loaded_model = predict._load_model(
         model_path=model_path,
-        num_classes=model.num_classes,
-        train_cl_args=cl_args,
+        model_class=CNNModel,
+        model_init_kwargs=cnn_init_kwargs,
         device=cl_args.device,
     )
     # make sure we're in eval model
@@ -53,15 +56,64 @@ def test_load_model(args_config, tmp_path):
         assert param_model.data.ne(param_loaded.data).sum() == 0
 
 
-def test_modify_train_cl_args_for_testing():
-    cl_args_from_train = Namespace(data_source="train/data/folder", lr=1e-3)
-    cl_args_from_predict = Namespace(data_source="test/data/folder")
-
-    mixed_args = predict._modify_train_cl_args_for_testing(
-        cl_args_from_train, cl_args_from_predict
+@pytest.mark.parametrize(
+    "train_cl_args, predict_cl_args, expected_train_after, expected_predict_after",
+    [
+        (
+            Namespace(key1=1, key2=2),
+            Namespace(key2="should_be_present_in_train", key3="unique_to_test"),
+            Namespace(key1=1, key2="should_be_present_in_train"),
+            Namespace(key3="unique_to_test"),
+        )
+    ],
+)
+def test_converge_train_and_predict_cl_args(
+    train_cl_args: Namespace,
+    predict_cl_args: Namespace,
+    expected_train_after: Namespace,
+    expected_predict_after: Namespace,
+) -> None:
+    train_converged, predict_converged = predict._converge_train_and_predict_cl_args(
+        train_cl_args=train_cl_args, predict_cl_args=predict_cl_args
     )
-    assert mixed_args.data_source == "test/data/folder"
-    assert mixed_args.lr == 1e-3
+
+    assert train_converged == expected_train_after
+    assert predict_converged == expected_predict_after
+
+
+@pytest.mark.parametrize(
+    "train_cl_args, predict_cl_args, expected_train_after_overload",
+    [
+        (
+            Namespace(key1=1, key2=2),
+            Namespace(key2="should_be_present_in_train"),
+            Namespace(key1=1, key2="should_be_present_in_train"),
+        )
+    ],
+)
+def test_overload_train_cl_args_for_predict(
+    train_cl_args: Namespace, predict_cl_args: Namespace, expected_train_after_overload
+) -> None:
+    train_after_overload = predict._overload_train_cl_args_for_predict(
+        train_cl_args=train_cl_args, predict_cl_args=predict_cl_args
+    )
+    assert train_after_overload == expected_train_after_overload
+
+
+@pytest.mark.parametrize(
+    "namespace, keys_to_remove, expected_namespace_after_filter",
+    [(Namespace(key1=1, key2=2), ["key1"], Namespace(key2=2))],
+)
+def test_remove_keys_from_namespace(
+    namespace: Namespace,
+    keys_to_remove: Iterable[str],
+    expected_namespace_after_filter: Namespace,
+) -> None:
+
+    test_output = predict._remove_keys_from_namespace(
+        namespace=namespace, keys_to_remove=keys_to_remove
+    )
+    assert test_output == expected_namespace_after_filter
 
 
 @pytest.mark.parametrize("create_test_data", [{"task_type": "multi"}], indirect=True)
@@ -78,7 +130,7 @@ def test_modify_train_cl_args_for_testing():
     ],
     indirect=True,
 )
-def test_load_labels_for_testing(
+def test_load_labels_for_predict(
     create_test_data, create_test_datasets, create_test_cl_args, keep_outputs
 ):
     """
@@ -86,12 +138,15 @@ def test_load_labels_for_testing(
     as the testing-set.
     """
     cl_args = create_test_cl_args
-    # so we test the scaling of the test set as well
 
     run_path = Path(f"runs/{cl_args.run_name}/")
 
-    test_labels_dict = predict._load_labels_for_testing(test_train_cl_args_mix=cl_args)
-    df_test = pd.DataFrame.from_dict(test_labels_dict, orient="index")
+    test_ids = predict.gather_ids_from_tabular_file(file_path=Path(cl_args.label_file))
+    tabular_info = set_up_all_label_data(cl_args=cl_args)
+
+    df_test = predict._load_labels_for_predict(
+        tabular_info=tabular_info, ids_to_keep=test_ids
+    )
 
     # make sure that target column is unchanged (within expected bounds)
     con_target_column = cl_args.target_con_columns[0]
@@ -110,7 +165,6 @@ def test_load_labels_for_testing(
         cleanup(run_path)
 
 
-@patch("human_origins_supervised.predict._load_transformers", autospec=True)
 @pytest.mark.parametrize("create_test_data", [{"task_type": "multi"}], indirect=True)
 @pytest.mark.parametrize(
     "create_test_cl_args",
@@ -121,21 +175,36 @@ def test_load_labels_for_testing(
     indirect=True,
 )
 def test_set_up_test_dataset(
-    mocked_load_transformers, create_test_data, create_test_cl_args
+    create_test_data, create_test_cl_args, create_test_data_dimensions
 ):
     test_data_config = create_test_data
     c = test_data_config
     cl_args = create_test_cl_args
+    data_dimensions = create_test_data_dimensions
     classes_tested = sorted(list(c.target_classes.keys()))
 
-    test_labels_dict = predict._load_labels_for_testing(test_train_cl_args_mix=cl_args)
+    test_ids = predict.gather_ids_from_tabular_file(file_path=Path(cl_args.label_file))
+    tabular_info = set_up_all_label_data(cl_args=cl_args)
+
+    df_test = predict._load_labels_for_predict(
+        tabular_info=tabular_info, ids_to_keep=test_ids
+    )
 
     target_column = create_test_cl_args.target_cat_columns[0]
     mock_encoder = LabelEncoder().fit(["Asia", "Europe", "Africa"])
-    mocked_load_transformers.return_value = {target_column: mock_encoder}
+    transformers = {target_column: mock_encoder}
 
-    test_dataset = predict._set_up_test_dataset(
-        test_train_cl_args_mix=cl_args, test_labels_dict=test_labels_dict
+    df_test_dict = predict.parse_labels_for_testing(
+        tabular_info=tabular_info,
+        df_labels_test=df_test,
+        label_transformers=transformers,
+    )
+
+    test_dataset = predict._set_up_default_test_dataset(
+        data_dimensions=data_dimensions,
+        cl_args=cl_args,
+        target_labels_dict=df_test_dict,
+        tabular_inputs_labels_dict=None,
     )
 
     exp_no_samples = c.n_per_class * len(classes_tested)
@@ -144,6 +213,7 @@ def test_set_up_test_dataset(
         dataset=test_dataset,
         exp_no_sample=exp_no_samples,
         classes_tested=classes_tested,
+        target_transformers=transformers,
         target_column=target_column,
     )
 
@@ -166,6 +236,7 @@ def grab_latest_model_path(saved_models_folder: Path):
                 "run_name": "test_run_predict",
                 "n_epochs": 2,
                 "checkpoint_interval": 50,
+                "sample_interval": 50,
                 # to save time since we're not testing the modelling
                 "get_acts": False,
             }
@@ -175,7 +246,7 @@ def grab_latest_model_path(saved_models_folder: Path):
 )
 def test_predict(keep_outputs, prep_modelling_test_configs):
     config, test_config = prep_modelling_test_configs
-    test_path = Path(config.cl_args.data_source).parent
+    test_path = Path(config.cl_args.omics_sources[0]).parent
 
     train.train(config)
 
@@ -184,20 +255,41 @@ def test_predict(keep_outputs, prep_modelling_test_configs):
         model_path=model_path,
         batch_size=64,
         evaluate=True,
-        data_source=test_path / "test_arrays_test_set",
+        label_file=config.cl_args.label_file,
+        omics_sources=[test_path / "test_arrays_test_set"],
+        omics_names=["test"],
         output_folder=test_path,
         device="cpu",
+        dataloader_workers=0,
+        get_acts=True,
+        act_classes=None,
+        max_acts_per_class=None,
     )
 
-    predict.predict(predict_cl_args=predict_cl_args)
+    train_config = predict._load_serialized_train_config(
+        run_folder=test_config.run_path
+    )
 
-    df_test = pd.read_csv(test_path / "predictions.csv", index_col="ID")
+    predict_config = predict.get_default_predict_config(
+        loaded_train_config=train_config, predict_cl_args=predict_cl_args
+    )
+
+    predict.predict(predict_cl_args=predict_cl_args, predict_config=predict_config)
+
+    predict._compute_predict_activations(
+        train_config=train_config,
+        predict_config=predict_config,
+        predict_cl_args=predict_cl_args,
+    )
+
+    origin_predictions_path = test_path / "Origin" / "predictions.csv"
+    df_test = pd.read_csv(origin_predictions_path, index_col="ID")
 
     target_column = config.cl_args.target_cat_columns[0]
     target_classes = sorted(config.target_transformers[target_column].classes_)
 
     # check that columns in predictions.csv are in correct sorted order
-    assert (target_classes == df_test.columns).all()
+    assert set(target_classes).issubset(set(df_test.columns))
 
     for cls in target_classes:
         class_indices = [i for i in df_test.index if i.endswith(cls)]
@@ -205,7 +297,20 @@ def test_predict(keep_outputs, prep_modelling_test_configs):
         num_correct = (df_cur_class.idxmax(axis=1) == cls).sum()
 
         # check that most were correct
-        assert num_correct / df_cur_class.shape[0] > 0.9
+        assert num_correct / df_cur_class.shape[0] > 0.80
 
+    assert (test_path / "Origin/activations").exists()
     if not keep_outputs:
         cleanup(test_config.run_path)
+
+
+def set_up_all_label_data(cl_args: argparse.Namespace) -> TabularFileInfo:
+
+    table_info = TabularFileInfo(
+        file_path=cl_args.label_file,
+        con_columns=cl_args.target_con_columns + cl_args.extra_con_columns,
+        cat_columns=cl_args.target_cat_columns + cl_args.extra_cat_columns,
+        parsing_chunk_size=cl_args.label_parsing_chunk_size,
+    )
+
+    return table_info

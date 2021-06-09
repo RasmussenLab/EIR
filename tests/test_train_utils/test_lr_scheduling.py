@@ -1,19 +1,20 @@
 from math import isclose
+from unittest.mock import patch
 
 import pytest
 import torch
 from ignite.contrib.handlers import (
-    ProgressBar,
     ConcatScheduler,
     CosineAnnealingScheduler,
-    PiecewiseLinear,
+    ParamGroupScheduler,
 )
 from ignite.engine import Engine, State
 from torch.optim import Adam, SGD
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from human_origins_supervised.train_utils import lr_scheduling
-from human_origins_supervised.train_utils.train_handlers import HandlerConfig
+from eir.train_utils import lr_scheduling
+from eir.train_utils.lr_scheduling import get_optimizer_lr
+from eir.train_utils.train_handlers import HandlerConfig
 
 
 @pytest.fixture()
@@ -51,7 +52,7 @@ def test_get_reduce_lr_on_plateu_step_params(args_config, create_dummy_test_opti
     cl_args = args_config
     optimizer = create_dummy_test_optimizer
 
-    params = lr_scheduling._get_reduce_lr_on_plateu_step_params(
+    params = lr_scheduling._get_reduce_lr_on_plateau_step_params(
         cl_args=cl_args, optimizer=optimizer
     )
 
@@ -72,7 +73,6 @@ def get_dummy_handler_config(prep_modelling_test_configs) -> HandlerConfig:
         config=config,
         run_folder=test_config.run_path,
         run_name=cl_args.run_name,
-        pbar=ProgressBar(),
         monitoring_metrics=[("tmp_var", "tmp_var")],
     )
 
@@ -93,10 +93,8 @@ def test_set_up_lr_scheduler_plateau(get_dummy_handler_config):
     lr_scheduler = lr_scheduling.set_up_lr_scheduler(handler_config=handler_config)
     assert isinstance(lr_scheduler, ReduceLROnPlateau)
 
-    expected_patience = lr_scheduling._calc_plateu_patience(
-        steps_per_epoch=len(handler_config.config.train_loader),
-        sample_interval=cl_args.sample_interval,
-    )
+    # Note: Check comment in lr_scheduling.set_up_lr_scheduler for why -1
+    expected_patience = cl_args.lr_plateau_patience - 1
     assert lr_scheduler.patience == expected_patience
     assert lr_scheduler.optimizer == c.optimizer
 
@@ -140,7 +138,7 @@ def _check_warmup_concat_scheduler(
     assert len(scheduler_list) == 2
     warmup_scheduler = scheduler_list[0]
     cosine_scheduler = scheduler_list[1]
-    assert isinstance(warmup_scheduler, PiecewiseLinear)
+    assert isinstance(warmup_scheduler, ParamGroupScheduler)
     assert isinstance(cosine_scheduler, CosineAnnealingScheduler)
 
     assert lr_scheduler.durations[0] == warmup_steps
@@ -243,20 +241,6 @@ def test_calculate_auto_warmup_steps_adaptive(create_dummy_test_optimizer):
     assert steps_mapping[fixture_params["b2"]] == warmup_steps
 
 
-@pytest.mark.parametrize(
-    "test_input,expected",
-    [
-        ({"steps_per_epoch": 15000, "sample_interval": 1000}, 30),  # 15 per epoch
-        ({"steps_per_epoch": 100, "sample_interval": 50}, 4),  # 2 per epoch
-        ({"steps_per_epoch": 100, "sample_interval": 200}, 2),  # 0.5 per epoch, min 1
-        ({"steps_per_epoch": 14591, "sample_interval": 3000}, 8),  # 4 per epoch
-    ],
-)
-def test_calc_plateau_patience(test_input, expected):
-    patience = lr_scheduling._calc_plateu_patience(**test_input)
-    assert patience == expected
-
-
 @pytest.mark.parametrize("test_schedule", ["cycle", "cosine"])
 def ttest_attach_warmup_to_scheduler(test_schedule, create_dummy_test_optimizer):
     optimizer = create_dummy_test_optimizer
@@ -305,7 +289,10 @@ def create_test_ignite_engine():
 def create_test_plateau_scheduler(create_dummy_test_optimizer):
     optimizer = create_dummy_test_optimizer
     scheduler = ReduceLROnPlateau(
-        optimizer=optimizer, mode="min", patience=2, min_lr=1e-6
+        optimizer=optimizer,
+        mode="max",
+        patience=2,
+        min_lr=1e-6,
     )
     return scheduler
 
@@ -316,27 +303,35 @@ def test_step_reduce_on_plateau_scheduler(
     create_test_plateau_scheduler,
     create_dummy_val_history_file,
 ):
-    def _get_lr(optimizer):
-        return optimizer.param_groups[0]["lr"]
+    def step_func(mock_return_value):
 
-    def step_func():
-        lr_scheduling._step_reduce_on_plateau_scheduler(
-            engine=test_engine,
-            optimizer=test_optimizer,
-            lr_upper_bound=lr_ub,
-            lr_lower_bound=lr_lb,
-            sample_interval=sample_interval,
-            reduce_on_plateau_scheduler=test_scheduler,
-            validation_history_fpath=hist_file,
-            warmup_steps=warmup_steps,
-        )
+        # NOTE: A bit hacky, but lr_scheduling is getting it's dataframe by calling
+        # a function in metrics.py, that's why we need to mock that
+        patch_target = "eir.train_utils.metrics.pd.Series.iloc"
+        with patch(target=patch_target, autospec=True) as m:
+
+            # What we really are mocking is the __getitem__ called last in
+            # validation_df["perf-average"].iloc[-1], but we cannot mock it directly
+            m.__getitem__.return_value = mock_return_value
+
+            lr_scheduling._step_reduce_on_plateau_scheduler(
+                engine=test_engine,
+                optimizer=test_optimizer,
+                lr_upper_bound=lr_ub,
+                lr_lower_bound=lr_lb,
+                sample_interval=sample_interval,
+                reduce_on_plateau_scheduler=test_scheduler,
+                validation_history_fpath=hist_file,
+                warmup_steps=warmup_steps,
+            )
+
         test_engine.state.iteration += 1
 
     test_engine = create_test_ignite_engine
     test_optimizer = create_dummy_test_optimizer
     test_scheduler = create_test_plateau_scheduler
 
-    lr_ub = _get_lr(optimizer=test_optimizer)
+    lr_ub = get_optimizer_lr(optimizer=test_optimizer)
     lr_lb = test_scheduler.min_lrs[0]
 
     sample_interval = 1
@@ -345,32 +340,27 @@ def test_step_reduce_on_plateau_scheduler(
 
     # note that optimizer starts with base lr, then lr is modified according to
     # upper and lower bounds,
-    assert _get_lr(test_optimizer) == lr_ub
+    assert get_optimizer_lr(test_optimizer) == lr_ub
 
     # step 1
-    step_func()
-    assert _get_lr(test_optimizer) == lr_lb + ((lr_ub - lr_lb) / warmup_steps)
+    step_func(0)
+    assert get_optimizer_lr(test_optimizer) == lr_lb + ((lr_ub - lr_lb) / warmup_steps)
 
     # step 2 - 19
     for i in range(warmup_steps - 1):
-        step_func()
+        step_func(-i)
 
     # step 20 - 100
     for i in range(100 - warmup_steps):
-        step_func()
+        step_func(-i)
 
-    assert isclose(_get_lr(optimizer=test_optimizer), lr_lb)
+    assert isclose(get_optimizer_lr(optimizer=test_optimizer), lr_lb)
 
 
 @pytest.fixture()
 def create_dummy_val_history_file(tmp_path):
-    # Note that this has a growing loss, so e.g. plateau scheduler with mode='min'
-    # should get called
     tmp_file = tmp_path / "dummy_val_history.csv"
     with open(str(tmp_file), "w") as outfile:
-        outfile.write("iteration,loss-average\n")
-
-        for iteration in range(100):
-            outfile.write(f"{iteration},{float(iteration)*2}\n")
+        outfile.write("iteration,loss-average,perf-average\n")
 
     return tmp_file

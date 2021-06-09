@@ -1,9 +1,8 @@
-from argparse import Namespace
-
 import pytest
-import torch
 
-from human_origins_supervised.models import models, layers
+from eir.models import layers
+from eir.models.omics import models_cnn
+from eir.train import DataDimensions
 
 
 def test_make_conv_layers():
@@ -16,10 +15,12 @@ def test_make_conv_layers():
 
     """
     conv_layer_list = [1, 1, 1, 1]
-    test_cl_args = Namespace(
+    test_model_config = models_cnn.CNNModelConfig(
         kernel_width=5,
+        layers=None,
+        fc_repr_dim=512,
+        data_dimensions=DataDimensions(channels=1, height=4, width=int(8e5)),
         down_stride=4,
-        target_width=int(8e5),
         rb_do=0.1,
         first_kernel_expansion=1,
         first_stride_expansion=5,
@@ -28,11 +29,13 @@ def test_make_conv_layers():
         channel_exp_base=5,
         sa=True,
     )
-    conv_layers = models._make_conv_layers(conv_layer_list, test_cl_args)
+    conv_layers = models_cnn._make_conv_layers(
+        residual_blocks=conv_layer_list, cnn_model_configuration=test_model_config
+    )
 
     # account for first block, add +2 instead if using SA
     assert len(conv_layers) == len(conv_layer_list) + 2
-    assert isinstance(conv_layers[0], layers.FirstBlock)
+    assert isinstance(conv_layers[0], layers.FirstCNNBlock)
     assert isinstance(conv_layers[-2], layers.SelfAttention)
 
 
@@ -41,38 +44,6 @@ def get_test_module_dict_data():
     test_fc_in = 128
 
     return test_classes_dict, test_fc_in
-
-
-def test_get_module_dict_from_target_columns():
-    test_classes_dict, test_fc_in = get_test_module_dict_data()
-
-    output_layer_model_dict = models._get_module_dict_from_target_columns(
-        num_classes=test_classes_dict, fc_in=test_fc_in
-    )
-
-    for target_column, num_classes in test_classes_dict.items():
-        cur_module = output_layer_model_dict[target_column]
-        assert cur_module.in_features == test_fc_in
-        assert cur_module.out_features == test_classes_dict[target_column]
-
-
-def test_calculate_final_multi_output():
-    test_classes_dict, test_fc_in = get_test_module_dict_data()
-
-    output_layer_model_dict = models._get_module_dict_from_target_columns(
-        num_classes=test_classes_dict, fc_in=test_fc_in
-    )
-
-    test_input = torch.zeros(128)
-
-    test_multi_output = models._calculate_module_dict_outputs(
-        input_=test_input, module_dict=output_layer_model_dict
-    )
-
-    # since the input is zero, we only get the bias
-    for target_column, tensor in test_multi_output.items():
-        module_bias = output_layer_model_dict[target_column].bias
-        assert (module_bias == tensor).all()
 
 
 @pytest.mark.parametrize(
@@ -84,7 +55,7 @@ def test_calculate_final_multi_output():
     ],
 )
 def test_get_cur_dilation(test_input, expected):
-    test_dilation = models._get_cur_dilation(**test_input)
+    test_dilation = models_cnn._get_cur_dilation(**test_input)
 
     assert test_dilation == expected
 
@@ -111,9 +82,10 @@ def test_get_cur_dilation(test_input, expected):
 def test_cnn_model(
     parse_test_cl_args, create_test_data, create_test_cl_args, create_test_model
 ):
-    cnn_test_model = create_test_model
+    fusion_model = create_test_model
+    cnn_model = fusion_model.modules_to_fuse["omics_test"]
 
-    assert isinstance(cnn_test_model.conv[0], models.FirstBlock)
+    assert isinstance(cnn_model.conv[0], models_cnn.FirstCNNBlock)
     assert True
 
 

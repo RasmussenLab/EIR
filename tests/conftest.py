@@ -1,28 +1,33 @@
 import csv
+import warnings
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
 from random import shuffle
 from shutil import rmtree
-from types import SimpleNamespace
 from typing import List, Tuple, Dict
-import warnings
 
 import numpy as np
+import pandas as pd
 import pytest
 from _pytest.fixtures import SubRequest
 from aislib.misc_utils import ensure_path_exists
 from torch import cuda
+from torch import nn
 from torch.utils.data import DataLoader
 
-from human_origins_supervised import train
-from human_origins_supervised.data_load import datasets
-from human_origins_supervised.models.extra_inputs_module import (
-    set_up_and_save_embeddings_dict,
+from eir import train
+from eir.data_load import datasets
+from eir.train import (
+    Config,
+    get_model_from_cl_args,
+    set_up_num_outputs_per_target,
 )
-from human_origins_supervised.train import Config, get_model
-from human_origins_supervised.train_utils.utils import configure_root_logger
-from human_origins_supervised.train_utils.utils import get_run_folder
+from eir.train_utils import optimizers, metrics
+from eir.train_utils.utils import (
+    configure_root_logger,
+    get_run_folder,
+)
 
 np.random.seed(0)
 
@@ -59,58 +64,76 @@ def parse_test_cl_args(request):
 
 
 @pytest.fixture
-def args_config():
-    test_cl_args = SimpleNamespace(
+def args_config() -> Namespace:
+    """
+    TODO: Get from configuration.py, and then modify?
+    """
+    test_cl_args = Namespace(
         **{
             "act_classes": None,
+            "act_every_sample_factor": 0,
             "b1": 0.9,
             "b2": 0.999,
-            "batch_size": 64,
+            "batch_size": 32,
             "channel_exp_base": 5,
-            "checkpoint_interval": 100,
+            "checkpoint_interval": None,
             "extra_con_columns": [],
             "custom_lib": None,
-            "data_source": "REPLACE_ME",
+            "omics_sources": "REPLACE_ME",
+            "omics_names": "REPLACE_ME",
+            "debug": False,
             "device": "cuda:0" if cuda.is_available() else "cpu",
             "dilation_factor": 1,
+            "dataloader_workers": 1,
             "down_stride": 4,
             "extra_cat_columns": [],
-            "early_stopping": False,
+            "early_stopping_patience": None,
+            "early_stopping_buffer": None,
             "fc_repr_dim": 64,
             "fc_task_dim": 32,
             "fc_do": 0.0,
+            "find_lr": False,
             "first_kernel_expansion": 1,
             "first_stride_expansion": 1,
             "first_channel_expansion": 1,
+            "fusion_model_type": "default",
             "get_acts": True,
             "gpu_num": "0",
             "kernel_width": 12,
             "label_file": "REPLACE_ME",
-            "l1": 0.0,
-            "lr": 1e-2,
+            "label_parsing_chunk_size": None,
+            "l1": 1e-03,
+            "lr": 1e-02,
             "lr_lb": 1e-5,
             "lr_schedule": "plateau",
-            "memory_dataset": False,
+            "max_acts_per_class": None,
+            "memory_dataset": True,
+            "mixing_type": None,
+            "mixing_alpha": 0.0,
+            "mg_num_experts": 3,
             "model_type": "cnn",
             "multi_gpu": False,
             "n_cpu": 8,
             "n_epochs": 5,
+            "n_saved_models": None,
             "na_augment_perc": 0.05,
             "na_augment_prob": 0.20,
             "no_pbar": False,
-            "optimizer": "adamw",
+            "optimizer": "adam",
+            "lr_plateau_patience": 5,
+            "lr_plateau_factor": 0.1,
             "plot_skip_steps": 50,
-            "rb_do": 0.0,
-            "resblocks": None,
+            "rb_do": 0.25,
+            "layers": [1, 1],
             "run_name": "test_run",
             "sa": False,
-            "sample_interval": 100,
+            "sample_interval": 200,
+            "split_mlp_num_splits": 16,
             "target_cat_columns": ["Origin"],
             "target_con_columns": [],
-            "target_width": 1000,
             "valid_size": 0.05,
             "warmup_steps": 100,
-            "wd": 0.00,
+            "wd": 1e-03,
             "weighted_sampling_column": None,
         }
     )
@@ -239,7 +262,6 @@ def _save_test_array_to_disk(
     base_array, snp_idxs_candidates = _set_up_base_test_array(c.n_snps)
 
     cur_test_array, snps_this_sample = _create_test_array(
-        test_task=c.task_type,
         base_array=base_array,
         snp_idxs_candidates=snp_idxs_candidates,
         snp_row_idx=active_snp_row_idx,
@@ -261,13 +283,10 @@ def _set_up_base_test_array(n_snps: int) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _create_test_array(
-    test_task: str,
     base_array: np.ndarray,
     snp_idxs_candidates: np.ndarray,
     snp_row_idx: int,
 ) -> Tuple[np.ndarray, List[int]]:
-    """
-    """
     # make samples have missing for chosen, otherwise might have alleles chosen
     # below by random, without having the phenotype
     base_array[:, snp_idxs_candidates] = 0
@@ -295,13 +314,23 @@ def _set_up_test_data_array_outpath(base_folder: Path) -> Path:
 
 
 def write_test_data_snp_file(base_folder: Path, n_snps: int) -> None:
+    """
+    BIM specs:
+        0. Chromosome code
+        1. Variant ID
+        2. Position in centi-morgans
+        3. Base-pair coordinate (1-based)
+        4. ALT allele cod
+        5. REF allele code
+    """
     snp_file = base_folder / "test_snps.bim"
-    base_snp_string_list = ["1", "REPLACE_W_IDX", "0.1", "10", "A", "T"]
+    base_snp_string_list = ["1", "REPLACE_W_IDX", "0.1", "REPLACE_W_IDX", "A", "T"]
 
     with open(str(snp_file), "w") as snpfile:
         for snp_idx in range(n_snps):
             cur_snp_list = base_snp_string_list[:]
             cur_snp_list[1] = str(snp_idx)
+            cur_snp_list[3] = str(snp_idx)
 
             cur_snp_string = "\t".join(cur_snp_list)
             snpfile.write(cur_snp_string + "\n")
@@ -320,18 +349,15 @@ def split_test_array_folder(test_folder: Path) -> None:
 
 
 @pytest.fixture()
-def create_test_cl_args(request, args_config, create_test_data):
+def create_test_cl_args(request, args_config, create_test_data) -> Namespace:
     c = create_test_data
     test_path = c.scoped_tmp_path
 
-    n_snps = request.config.getoption("--num_snps")
-
-    args_config.data_source = str(test_path / "test_arrays")
+    args_config.omics_sources = [str(test_path / "test_arrays")]
+    args_config.omics_names = ["omics_test"]
     args_config.snp_file = str(test_path / "test_snps.bim")
     args_config.model_task = c.task_type
     args_config.label_file = str(test_path / "labels.csv")
-
-    args_config.target_width = n_snps
 
     # If tests need to have their own config different from the base defined above,
     # only supporting custom_cl_args hardcoded for now
@@ -352,22 +378,34 @@ def create_test_cl_args(request, args_config, create_test_data):
 
 
 @pytest.fixture()
-def create_test_model(create_test_cl_args, create_test_datasets):
+def create_test_data_dimensions(create_test_cl_args, create_test_data):
+
     cl_args = create_test_cl_args
-    train_dataset, _ = create_test_datasets
 
-    run_folder = get_run_folder(cl_args.run_name)
-
-    embedding_dict = set_up_and_save_embeddings_dict(
-        embedding_columns=cl_args.extra_cat_columns,
-        labels_dict=train_dataset.labels_dict,
-        run_folder=run_folder,
+    data_dimensions = train._gather_all_omics_data_dimensions(
+        omics_sources=cl_args.omics_sources, omics_names=cl_args.omics_names
     )
 
-    model = get_model(
+    return data_dimensions
+
+
+@pytest.fixture()
+def create_test_model(
+    create_test_cl_args, create_test_labels, create_test_data_dimensions
+) -> nn.Module:
+    cl_args = create_test_cl_args
+    target_labels, tabular_input_labels = create_test_labels
+    data_dimensions = create_test_data_dimensions
+
+    num_outputs_per_class = set_up_num_outputs_per_target(
+        target_transformers=target_labels.label_transformers
+    )
+
+    model = get_model_from_cl_args(
         cl_args=cl_args,
-        num_classes=train_dataset.num_classes,
-        embedding_dict=embedding_dict,
+        omics_data_dimensions=data_dimensions,
+        num_outputs_per_target=num_outputs_per_class,
+        tabular_label_transformers=tabular_input_labels.label_transformers,
     )
 
     return model
@@ -378,21 +416,49 @@ def cleanup(run_path):
 
 
 @pytest.fixture()
-def create_test_datasets(create_test_data, create_test_cl_args):
-    c = create_test_data
+def create_test_labels(create_test_data, create_test_cl_args):
 
     cl_args = create_test_cl_args
-    cl_args.data_source = str(c.scoped_tmp_path / "test_arrays")
 
-    run_path = Path(f"runs/{cl_args.run_name}/")
+    run_folder = get_run_folder(run_name=cl_args.run_name)
 
     # TODO: Use better logic here, to do the cleanup. Should not be in this fixture.
-    if run_path.exists():
-        cleanup(run_path)
+    if run_folder.exists():
+        cleanup(run_folder)
 
-    ensure_path_exists(run_path, is_folder=True)
+    ensure_path_exists(run_folder, is_folder=True)
 
-    train_dataset, valid_dataset = datasets.set_up_datasets(cl_args)
+    target_labels, tabular_input_labels = train.get_target_and_tabular_input_labels(
+        cl_args=cl_args, custom_label_parsing_operations=None
+    )
+    train.save_transformer_set(
+        transformers=target_labels.label_transformers, run_folder=run_folder
+    )
+    train.save_transformer_set(
+        transformers=tabular_input_labels.label_transformers, run_folder=run_folder
+    )
+
+    return target_labels, tabular_input_labels
+
+
+@pytest.fixture()
+def create_test_datasets(
+    create_test_data,
+    create_test_labels,
+    create_test_cl_args,
+    create_test_data_dimensions,
+):
+
+    cl_args = create_test_cl_args
+    target_labels, tabular_input_labels = create_test_labels
+    data_dimensions = create_test_data_dimensions
+
+    train_dataset, valid_dataset = datasets.set_up_datasets_from_cl_args(
+        cl_args=cl_args,
+        data_dimensions=data_dimensions,
+        target_labels=target_labels,
+        tabular_inputs_labels=tabular_input_labels,
+    )
 
     return train_dataset, valid_dataset
 
@@ -403,24 +469,33 @@ def create_test_dloaders(create_test_cl_args, create_test_datasets):
     train_dataset, valid_dataset = create_test_datasets
 
     train_dloader = DataLoader(
-        train_dataset, batch_size=cl_args.batch_size, shuffle=True
+        train_dataset, batch_size=cl_args.batch_size, shuffle=True, drop_last=True
     )
 
     valid_dloader = DataLoader(
-        valid_dataset, batch_size=cl_args.batch_size, shuffle=False
+        valid_dataset, batch_size=cl_args.batch_size, shuffle=False, drop_last=True
     )
 
     return train_dloader, valid_dloader, train_dataset, valid_dataset
 
 
-@pytest.fixture()
-def create_test_optimizer(create_test_cl_args, create_test_model):
-    cl_args = create_test_cl_args
-    model = create_test_model
+def create_test_optimizer(
+    cl_args: Namespace,
+    model: nn.Module,
+    criterions,
+):
 
-    optimizer = train.get_optimizer(model, cl_args)
+    """
+    TODO: Refactor loss module construction out of this function.
+    """
 
-    return optimizer
+    loss_module = train._get_loss_callable(criterions=criterions)
+
+    optimizer = optimizers.get_optimizer(
+        model=model, loss_callable=loss_module, cl_args=cl_args
+    )
+
+    return optimizer, loss_module
 
 
 @dataclass
@@ -435,11 +510,12 @@ class ModelTestConfig:
 @pytest.fixture()
 def prep_modelling_test_configs(
     create_test_data,
+    create_test_labels,
     create_test_cl_args,
     create_test_dloaders,
     create_test_model,
-    create_test_optimizer,
     create_test_datasets,
+    create_test_data_dimensions,
 ) -> Tuple[Config, ModelTestConfig]:
     """
     Note that the fixtures used in this fixture get indirectly parametrized by
@@ -447,35 +523,58 @@ def prep_modelling_test_configs(
     """
     cl_args = create_test_cl_args
     train_loader, valid_loader, train_dataset, valid_dataset = create_test_dloaders
+    target_labels, tabular_inputs_labels = create_test_labels
+    data_dimensions = create_test_data_dimensions
+
     model = create_test_model
-    optimizer = create_test_optimizer
+
+    num_outputs_per_target = set_up_num_outputs_per_target(
+        target_transformers=target_labels.label_transformers
+    )
+
     criterions = train._get_criterions(
         target_columns=train_dataset.target_columns, model_type=cl_args.model_type
     )
-    metrics = train._get_default_metrics(
-        target_transformers=train_dataset.target_transformers
+    test_metrics = metrics.get_default_metrics(
+        target_transformers=target_labels.label_transformers,
     )
-    metrics = _patch_metrics(metrics=metrics)
+    test_metrics = _patch_metrics(metrics_=test_metrics)
+
+    optimizer, loss_module = create_test_optimizer(
+        cl_args=cl_args,
+        model=model,
+        criterions=criterions,
+    )
 
     train_dataset, valid_dataset = create_test_datasets
 
-    train._log_num_params(model=model)
+    train._log_model(model=model, l1_weight=cl_args.l1)
 
+    hooks = train.get_default_hooks(cl_args_=cl_args)
     config = Config(
         cl_args=cl_args,
         train_loader=train_loader,
         valid_loader=valid_loader,
         valid_dataset=valid_dataset,
+        data_dimensions=data_dimensions,
         model=model,
         optimizer=optimizer,
         criterions=criterions,
-        metrics=metrics,
-        labels_dict=train_dataset.labels_dict,
-        target_transformers=train_dataset.target_transformers,
+        loss_function=loss_module,
+        metrics=test_metrics,
+        labels_dict=target_labels.train_labels,
+        target_transformers=target_labels.label_transformers,
+        num_outputs_per_target=num_outputs_per_target,
         target_columns=train_dataset.target_columns,
-        data_width=train_dataset.data_width,
         writer=train.get_summary_writer(run_folder=Path("runs", cl_args.run_name)),
-        custom_hooks=None,
+        hooks=hooks,
+    )
+
+    keys_to_serialize = train.get_default_config_keys_to_serialize()
+    train.serialize_config(
+        config=config,
+        run_folder=get_run_folder(cl_args.run_name),
+        keys_to_serialize=keys_to_serialize,
     )
 
     test_config = _get_cur_modelling_test_config(
@@ -485,7 +584,7 @@ def prep_modelling_test_configs(
     return config, test_config
 
 
-def _patch_metrics(metrics):
+def _patch_metrics(metrics_):
     warnings.warn(
         "This function will soon be deprecated as conftest will need to "
         "create its own metrics when train.py default metrics will be "
@@ -493,9 +592,9 @@ def _patch_metrics(metrics):
         category=DeprecationWarning,
     )
     for type_ in ("cat", "con"):
-        for metric_record in metrics[type_]:
+        for metric_record in metrics_[type_]:
             metric_record.only_val = False
-    return metrics
+    return metrics_
 
 
 def _get_cur_modelling_test_config(
@@ -511,8 +610,12 @@ def _get_cur_modelling_test_config(
     )
 
     gen = last_sample_folders.items
-    activations_path = {k: folder / "top_acts.npy" for k, folder in gen()}
-    masked_activations_path = {k: folder / "top_acts_masked.npy" for k, folder in gen()}
+    activations_path = {
+        k: folder / "activations/omics_test/top_acts.npy" for k, folder in gen()
+    }
+    masked_activations_path = {
+        k: folder / "activations/omics_test/top_acts_masked.npy" for k, folder in gen()
+    }
 
     test_config = ModelTestConfig(
         iteration=last_iter,
@@ -541,3 +644,17 @@ def _get_test_sample_folder(run_path: Path, iteration: int, column_name: str) ->
     sample_folder = run_path / f"results/{column_name}/samples/{iteration}"
 
     return sample_folder
+
+
+@pytest.fixture()
+def get_transformer_test_data():
+    test_labels_dict = {
+        "1": {"Origin": "Asia", "Height": 150},
+        "2": {"Origin": "Africa", "Height": 190},
+        "3": {"Origin": "Europe", "Height": 170},
+    }
+    test_labels_df = pd.DataFrame(test_labels_dict).T
+
+    test_target_columns_dict = {"con": ["Height"], "cat": ["Origin"]}
+
+    return test_labels_df, test_target_columns_dict

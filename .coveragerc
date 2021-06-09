@@ -1,3 +1,4 @@
 [run]
 omit = 
-    human_origins_supervised/visualization/*
+    eir/visualization/*
+    eir/configuration.py

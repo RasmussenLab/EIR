@@ -7,11 +7,15 @@ from torch.optim import SGD
 from torch.optim.adamw import AdamW
 from torch.utils.data import WeightedRandomSampler, SequentialSampler, RandomSampler
 
-from human_origins_supervised import train
-from human_origins_supervised.models.models import CNNModel, MLPModel
+from eir import train
+from eir.data_load import label_setup
+from eir.models.fusion import FusionModel
+from eir.models.omics.models_cnn import CNNModel
+from eir.models.omics.models_mlp import MLPModel
+from eir.train_utils import optimizers
 
 
-@patch("human_origins_supervised.train.utils.get_run_folder", autospec=True)
+@patch("eir.train.utils.get_run_folder", autospec=True)
 def test_prepare_run_folder_pass(patched_get_run_folder, tmp_path):
 
     # patch since we don't want to create run folders while testing
@@ -21,7 +25,7 @@ def test_prepare_run_folder_pass(patched_get_run_folder, tmp_path):
     assert (tmp_path / "test_folder").exists()
 
 
-@patch("human_origins_supervised.train.utils.get_run_folder", autospec=True)
+@patch("eir.train.utils.get_run_folder", autospec=True)
 def test_prepare_run_folder_fail(patched_get_run_folder, tmp_path):
 
     patched_path = tmp_path / "test_folder"
@@ -81,7 +85,7 @@ def test_get_dataloaders(create_test_cl_args, create_test_data, create_test_data
 
 
 def _modify_bs_for_multi_gpu():
-    patch_target = "human_origins_supervised.train.torch.cuda.device_count"
+    patch_target = "eir.train.torch.cuda.device_count"
     with patch(patch_target, autospec=True) as m:
         m.return_value = 2
 
@@ -102,11 +106,15 @@ def test_get_optimizer(args_config):
     model = FakeModel()
 
     args_config.optimizer = "adamw"
-    adamw_optimizer = train.get_optimizer(model, args_config)
+    adamw_optimizer = optimizers.get_optimizer(
+        model=model, loss_callable=lambda x: x, cl_args=args_config
+    )
     assert isinstance(adamw_optimizer, AdamW)
 
     args_config.optimizer = "sgdm"
-    sgdm_optimizer = train.get_optimizer(model, args_config)
+    sgdm_optimizer = optimizers.get_optimizer(
+        model=model, loss_callable=lambda x: x, cl_args=args_config
+    )
     assert isinstance(sgdm_optimizer, SGD)
     assert sgdm_optimizer.param_groups[0]["momentum"] == 0.9
 
@@ -116,18 +124,32 @@ def test_get_model(args_config):
     # TODO: Refactor checking of fc_3 into separate test.
 
     args_config.model_type = "cnn"
-    num_classes_dict = {"Origin": 10, "Height": 1}
-    cnn_model = train.get_model(args_config, num_classes_dict, None)
+    num_outputs_per_target_dict = {"Origin": 10, "Height": 1}
 
-    assert isinstance(cnn_model, CNNModel)
-    assert cnn_model.multi_task_branches["Origin"].fc_3_final.out_features == 10
-    assert cnn_model.multi_task_branches["Height"].fc_3_final.out_features == 1
+    data_dimensions = {
+        "omics_test": train.DataDimensions(channels=1, height=4, width=1000)
+    }
+
+    cnn_fusion_model = train.get_model_from_cl_args(
+        cl_args=args_config,
+        omics_data_dimensions=data_dimensions,
+        num_outputs_per_target=num_outputs_per_target_dict,
+        tabular_label_transformers=None,
+    )
+
+    assert isinstance(cnn_fusion_model, FusionModel)
+    assert cnn_fusion_model.multi_task_branches["Origin"][-1][-1].out_features == 10
+    assert cnn_fusion_model.multi_task_branches["Height"][-1][-1].out_features == 1
+    assert isinstance(cnn_fusion_model.modules_to_fuse["omics_test"], CNNModel)
 
     args_config.model_type = "mlp"
-    mlp_model = train.get_model(args_config, num_classes_dict, None)
-    assert isinstance(mlp_model, MLPModel)
-    assert mlp_model.multi_task_branches["Origin"].fc_3_final.out_features == 10
-    assert mlp_model.multi_task_branches["Height"].fc_3_final.out_features == 1
+    mlp_fusion_model = train.get_model_from_cl_args(
+        cl_args=args_config,
+        omics_data_dimensions=data_dimensions,
+        num_outputs_per_target=num_outputs_per_target_dict,
+        tabular_label_transformers=None,
+    )
+    assert isinstance(mlp_fusion_model.modules_to_fuse["omics_test"], MLPModel)
 
 
 def test_get_criterions_nonlinear():
@@ -139,7 +161,7 @@ def test_get_criterions_nonlinear():
 
     test_criterions = train._get_criterions(test_target_columns_dict, model_type="cnn")
     for column_name in test_target_columns_dict["con"]:
-        assert isinstance(test_criterions[column_name], nn.MSELoss)
+        assert test_criterions[column_name].func is train._calc_mse
 
     for column_name in test_target_columns_dict["cat"]:
         assert isinstance(test_criterions[column_name], nn.CrossEntropyLoss)
@@ -155,7 +177,7 @@ def test_get_criterions_linear_pass():
 
     assert len(test_criterions_con) == 1
     for column_name in test_target_columns_dict_con["con"]:
-        assert isinstance(test_criterions_con[column_name], nn.MSELoss)
+        assert test_criterions_con[column_name].func is train._calc_mse
 
     test_target_columns_dict_cat = {"con": [], "cat": ["Origin"]}
 
@@ -164,8 +186,7 @@ def test_get_criterions_linear_pass():
     )
     assert len(test_criterions_cat) == 1
     for column_name in test_target_columns_dict_cat["cat"]:
-        # TODO: Do this better, a bit hacky currently as calc_bce is private
-        assert test_criterions_cat[column_name].__name__ == "calc_bce"
+        assert test_criterions_cat[column_name] is train._calc_bce
 
 
 def test_check_linear_model_columns_pass():
@@ -200,3 +221,18 @@ def test_check_linear_model_columns_fail():
     )
     with pytest.raises(NotImplementedError):
         train._check_linear_model_columns(cl_args=test_input_mixed)
+
+
+def test_set_up_num_classes(get_transformer_test_data):
+    df_test, test_target_columns_dict = get_transformer_test_data
+
+    test_transformers = label_setup._get_fit_label_transformers(
+        df_labels=df_test, label_columns=test_target_columns_dict
+    )
+
+    num_classes = train.set_up_num_outputs_per_target(
+        target_transformers=test_transformers
+    )
+
+    assert num_classes["Height"] == 1
+    assert num_classes["Origin"] == 3
