@@ -364,6 +364,7 @@ def _check_test_performance_results(
             "injections": {
                 "global_configs": {
                     "lr": 1e-03,
+                    "n_epochs": 6,
                 },
                 "input_configs": [
                     {
@@ -396,6 +397,7 @@ def _check_test_performance_results(
                 "global_configs": {
                     "run_name": "mgmoe",
                     "lr": 1e-03,
+                    "n_epochs": 8,
                 },
                 "input_configs": [
                     {
@@ -410,7 +412,7 @@ def _check_test_performance_results(
                 ],
                 "predictor_configs": {
                     "model_type": "mgmoe",
-                    "model_config": {"mg_num_experts": 3},
+                    "model_config": {"mg_num_experts": 3, "layers": [1, 1]},
                 },
                 "target_configs": {
                     "target_cat_columns": ["Origin"],
@@ -426,6 +428,7 @@ def _check_test_performance_results(
                     "lr": 1e-03,
                     "mixing_alpha": 0.5,
                     "mixing_type": "cutmix-uniform",
+                    "n_epochs": 12,
                 },
                 "input_configs": [
                     {

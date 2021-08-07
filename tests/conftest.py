@@ -144,13 +144,14 @@ def get_test_base_global_init() -> Sequence[dict]:
             "get_acts": True,
             "act_every_sample_factor": 0,
             "act_background_samples": 256,
-            "n_epochs": 12,
+            "n_epochs": 6,
             "warmup_steps": 100,
             "lr": 1e-02,
             "lr_lb": 1e-05,
             "batch_size": 32,
             "valid_size": 0.05,
             "wd": 1e-03,
+            "memory_dataset": True,
         }
     ]
     return global_inits
@@ -227,7 +228,7 @@ def get_test_tabular_input_init(
 def get_test_base_predictor_init(model_type: Literal["nn", "linear"]) -> Sequence[dict]:
     if model_type == "linear":
         return [{}]
-    return [{"model_config": {"rb_do": 0.25, "fc_do": 0.25}}]
+    return [{"model_config": {"rb_do": 0.25, "fc_do": 0.25, "layers": [1]}}]
 
 
 def get_test_base_target_inits(test_data_config: "TestDataConfig") -> Sequence[dict]:
