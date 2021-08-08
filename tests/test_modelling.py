@@ -87,7 +87,7 @@ def test_classification(prep_modelling_test_configs):
     """
     experiment, test_config = prep_modelling_test_configs
 
-    train.train(experiment)
+    train.train(experiment=experiment)
 
     target_column = experiment.configs.target_configs[0].target_cat_columns[0]
 
@@ -363,8 +363,8 @@ def _check_test_performance_results(
         {
             "injections": {
                 "global_configs": {
-                    "lr": 1e-03,
-                    "n_epochs": 6,
+                    "lr": 1e-02,
+                    "n_epochs": 8,
                 },
                 "input_configs": [
                     {
@@ -374,15 +374,15 @@ def _check_test_performance_results(
                             "kernel_width": 8,
                             "channel_exp_base": 2,
                             "l1": 1e-03,
-                            "rb_do": 0.20,
+                            "rb_do": 0.25,
                         },
                     },
                 ],
                 "predictor_configs": {
                     "model_config": {
-                        "fc_task_dim": 64,
-                        "fc_do": 0.20,
-                        "rb_do": 0.20,
+                        "fc_task_dim": 32,
+                        "fc_do": 0.00,
+                        "rb_do": 0.25,
                     },
                 },
                 "target_configs": {
@@ -396,7 +396,7 @@ def _check_test_performance_results(
             "injections": {
                 "global_configs": {
                     "run_name": "mgmoe",
-                    "lr": 1e-03,
+                    "lr": 1e-02,
                     "n_epochs": 8,
                 },
                 "input_configs": [
@@ -412,7 +412,11 @@ def _check_test_performance_results(
                 ],
                 "predictor_configs": {
                     "model_type": "mgmoe",
-                    "model_config": {"mg_num_experts": 3, "layers": [1, 1]},
+                    "model_config": {
+                        "mg_num_experts": 3,
+                        "layers": [1, 1],
+                        "fc_do": 0.00,
+                    },
                 },
                 "target_configs": {
                     "target_cat_columns": ["Origin"],
@@ -425,7 +429,7 @@ def _check_test_performance_results(
             "injections": {
                 "global_configs": {
                     "run_name": "mixing_multi",
-                    "lr": 1e-03,
+                    "lr": 1e-02,
                     "mixing_alpha": 0.5,
                     "mixing_type": "cutmix-uniform",
                     "n_epochs": 12,
@@ -443,8 +447,8 @@ def _check_test_performance_results(
                 ],
                 "predictor_configs": {
                     "model_config": {
-                        "fc_task_dim": 64,
-                        "fc_do": 0.10,
+                        "fc_task_dim": 32,
+                        "fc_do": 0.00,
                         "rb_do": 0.10,
                     },
                 },
@@ -459,7 +463,7 @@ def _check_test_performance_results(
             "injections": {
                 "global_configs": {
                     "run_name": "limited_activations",
-                    "lr": 1e-03,
+                    "lr": 1e-02,
                     "max_acts_per_class": 100,
                 },
                 "input_configs": [
@@ -476,8 +480,8 @@ def _check_test_performance_results(
                 ],
                 "predictor_configs": {
                     "model_config": {
-                        "fc_task_dim": 64,
-                        "fc_do": 0.20,
+                        "fc_task_dim": 32,
+                        "fc_do": 0.00,
                         "rb_do": 0.20,
                     },
                 },

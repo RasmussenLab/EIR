@@ -152,6 +152,8 @@ def get_test_base_global_init() -> Sequence[dict]:
             "valid_size": 0.05,
             "wd": 1e-03,
             "memory_dataset": True,
+            "early_stopping_patience": None,
+            "early_stopping_buffer": None,
         }
     ]
     return global_inits
@@ -198,8 +200,8 @@ def get_test_omics_input_init(
         },
         "input_type_info": {
             "model_type": "genome-local-net",
-            "na_augment_perc": 0.10,
-            "na_augment_prob": 0.10,
+            "na_augment_perc": 0.05,
+            "na_augment_prob": 0.20,
             "snp_file": str(test_path / "test_snps.bim"),
         },
         "model_config": {},
@@ -245,8 +247,14 @@ def get_test_base_target_inits(test_data_config: "TestDataConfig") -> Sequence[d
 
 
 @pytest.fixture(scope="module")
-def create_test_data(request, tmp_path_factory, parse_test_cl_args) -> "TestDataConfig":
-    c = _create_test_data_config(request, tmp_path_factory, parse_test_cl_args)
+def create_test_data(
+    request, tmp_path_factory, parse_test_cl_args: dict
+) -> "TestDataConfig":
+    c = _create_test_data_config(
+        create_test_data_fixture_request=request,
+        tmp_path_factory=tmp_path_factory,
+        parsed_test_cl_args=parse_test_cl_args,
+    )
 
     fieldnames = ["ID", "Origin", "Height", "OriginExtraCol", "ExtraTarget"]
 
@@ -299,7 +307,9 @@ class TestDataConfig:
 
 
 def _create_test_data_config(
-    create_test_data_fixture_request: SubRequest, tmp_path_factory, parsed_test_cl_args
+    create_test_data_fixture_request: SubRequest,
+    tmp_path_factory,
+    parsed_test_cl_args: dict,
 ):
 
     request_params = create_test_data_fixture_request.param
